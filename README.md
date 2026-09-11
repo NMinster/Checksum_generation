@@ -16,7 +16,43 @@ Python 3.9 or newer.
 pip install -r requirements.txt
 ```
 
-## Usage
+## Quick start: fully automatic
+
+Keep the GEO metadata workbook on the external drive, in the folder that
+holds the data files (subfolders are fine). Plug the drive in, then:
+
+* **macOS**: double-click `run_geo_checksum.command` (the first time, right-click
+  and choose Open, since it is not signed)
+* **Windows**: double-click `run_geo_checksum.bat`
+* **any terminal**: `python geo_checksum.py auto`
+
+The tool then
+
+1. finds the attached external drive (`/Volumes/*` on macOS, non-system drive
+   letters on Windows, `/media` and `/run/media` on Linux),
+2. searches it for an `.xlsx` that has `file name` and `file checksum` columns,
+   which is how it recognises the GEO metadata template,
+3. shows you what it found and asks for confirmation,
+4. hashes every data file in the workbook's folder, saving progress to
+   `checksums.csv` next to the workbook so an interrupted run can resume,
+5. writes the checksums into the workbook in place, keeping a `.bak` copy, and
+   lists any file names in the sheet it could not match.
+
+If more than one drive or more than one candidate workbook is found, it stops
+and tells you which ones, and you can point it at the right one:
+
+```bash
+python geo_checksum.py auto --drive /Volumes/SEQDATA
+python geo_checksum.py auto --excel /Volumes/SEQDATA/project/GEO_metadata.xlsx
+python geo_checksum.py auto --excel ... --root /Volumes/SEQDATA/project/data   # data in a different folder
+python geo_checksum.py auto -y            # skip the confirmation prompt
+```
+
+The launchers install `openpyxl` on first run if it is missing. If the repo
+was downloaded as a zip into Downloads, unzip it first; the launcher works
+from wherever the folder sits.
+
+## Manual usage
 
 ### 1. Scan the drive
 

@@ -19,6 +19,12 @@ Typical workflow
 
        python geo_checksum.py scan /Volumes/MyDrive/project --out checksums.csv --excel GEO_metadata.xlsx
 
+Or let the tool find everything itself: it looks for an attached external
+drive, finds the GEO metadata workbook stored on it, hashes the data files in
+that folder and fills the workbook in place:
+
+       python geo_checksum.py auto
+
 GEO asks for MD5 checksums, which is the default algorithm.
 """
 
@@ -116,7 +122,9 @@ def iter_data_files(root: Path, patterns: Iterable[str], recursive: bool = True)
 
 
 def _matches(name: str, patterns: list[str]) -> bool:
-    if name in SKIP_NAMES or name.startswith("._"):
+    if name in SKIP_NAMES or name.startswith("._") or name.startswith("~$"):
+        return False
+    if name.endswith(".bak.xlsx") or name == "checksums.csv":
         return False
     return any(fnmatch.fnmatch(name, pat) for pat in patterns)
 
@@ -169,10 +177,12 @@ def _fmt_bytes(n: float) -> str:
 
 
 def scan(root: Path, out_csv: Path | None, patterns: list[str], algorithm: str,
-         recursive: bool = True, force: bool = False, quiet: bool = False) -> list[ChecksumRecord]:
+         recursive: bool = True, force: bool = False, quiet: bool = False,
+         exclude: Iterable[Path] = ()) -> list[ChecksumRecord]:
     """Hash every matching file under *root*; reuse cached results from *out_csv*."""
     if not root.exists():
         raise SystemExit(f"Path not found: {root}")
+    excluded = {str(Path(p).resolve()) for p in exclude}
 
     cached: dict[str, ChecksumRecord] = {}
     if out_csv is not None and not force:
@@ -180,7 +190,8 @@ def scan(root: Path, out_csv: Path | None, patterns: list[str], algorithm: str,
             if rec.algorithm == algorithm:
                 cached[rec.path] = rec
 
-    files = list(iter_data_files(root, patterns, recursive=recursive))
+    files = [f for f in iter_data_files(root, patterns, recursive=recursive)
+             if str(f.resolve()) not in excluded]
     if not files:
         print(f"No files matching {patterns} found under {root}", file=sys.stderr)
         return []
@@ -269,17 +280,17 @@ def find_sections(ws) -> list[Section]:
     """
     sections = []
     for row in ws.iter_rows():
-        name_col = checksum_col = None
+        name_col = checksum_col = header_row = None
         for cell in row:
             v = cell.value
             if not isinstance(v, str):
                 continue
             if name_col is None and FILE_NAME_HEADER.match(v):
-                name_col = cell.column
+                name_col, header_row = cell.column, cell.row
             elif checksum_col is None and CHECKSUM_HEADER.search(v):
                 checksum_col = cell.column
         if name_col is not None and checksum_col is not None:
-            sections.append(Section(row[0].row, name_col, checksum_col))
+            sections.append(Section(header_row, name_col, checksum_col))
     return sections
 
 
@@ -396,6 +407,149 @@ def fill_workbook(excel_path: Path, records: list[ChecksumRecord], sheet: str | 
     return {"filled": filled, "unchanged": unchanged, "missing": missing, "unused": unused}
 
 
+
+# --------------------------------------------------------------------------- #
+# Auto mode: find the external drive and the GEO workbook on it
+# --------------------------------------------------------------------------- #
+
+WORKBOOK_SEARCH_DEPTH = 4  # how deep to look for the .xlsx on the drive
+
+
+def candidate_drives() -> list[Path]:
+    """Return mount points that look like external / removable drives."""
+    drives: list[Path] = []
+    if sys.platform == "darwin":
+        root_dev = os.stat("/").st_dev
+        for p in sorted(Path("/Volumes").glob("*")):
+            try:
+                if p.is_dir() and p.stat().st_dev != root_dev:
+                    drives.append(p)
+            except OSError:
+                continue
+    elif sys.platform.startswith("win"):
+        import ctypes
+        import string
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        system_drive = os.environ.get("SystemDrive", "C:").rstrip("\\").upper()
+        bitmask = kernel32.GetLogicalDrives()
+        for i, letter in enumerate(string.ascii_uppercase):
+            if not bitmask & (1 << i):
+                continue
+            root = f"{letter}:\\"
+            # 2 = DRIVE_REMOVABLE, 3 = DRIVE_FIXED (USB hard drives usually report as fixed)
+            if kernel32.GetDriveTypeW(root) in (2, 3) and f"{letter}:" != system_drive:
+                drives.append(Path(root))
+    else:
+        user = os.environ.get("USER", "")
+        for base in (f"/media/{user}", "/media", f"/run/media/{user}", "/mnt"):
+            for p in sorted(Path(base).glob("*")):
+                if p.is_dir() and p not in drives and not p.name.startswith("."):
+                    drives.append(p)
+    return drives
+
+
+def find_geo_workbooks(root: Path, max_depth: int = WORKBOOK_SEARCH_DEPTH) -> list[Path]:
+    """Find .xlsx files under *root* that contain a 'file name' / 'checksum' section."""
+    try:
+        import openpyxl
+    except ImportError:
+        raise SystemExit("openpyxl is required: pip install openpyxl")
+    found = []
+    root_depth = len(root.resolve().parts)
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = len(Path(dirpath).resolve().parts) - root_depth
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(SKIP_DIR_PREFIXES))
+        if depth >= max_depth:
+            dirnames[:] = []
+        for name in sorted(filenames):
+            if not name.lower().endswith((".xlsx", ".xlsm")) or name.startswith(("~$", "._")):
+                continue
+            if name.lower().endswith(".bak.xlsx"):
+                continue
+            path = Path(dirpath) / name
+            try:
+                wb = openpyxl.load_workbook(path, read_only=True)
+                is_geo = any(find_sections(ws) for ws in wb.worksheets)
+                wb.close()
+            except Exception:  # corrupt / locked / not really an xlsx
+                continue
+            if is_geo:
+                found.append(path)
+    return found
+
+
+def _pick_workbook(workbooks: list[Path]) -> Path:
+    if len(workbooks) == 1:
+        return workbooks[0]
+    preferred = [w for w in workbooks if re.search(r"geo|metadata|template", w.name, re.I)]
+    if len(preferred) == 1:
+        return preferred[0]
+    listing = "\n".join(f"  {w}" for w in workbooks)
+    raise SystemExit(f"Found more than one GEO-style workbook; pick one with --excel:\n{listing}")
+
+
+def _confirm(prompt: str, assume_yes: bool) -> bool:
+    if assume_yes or not sys.stdin.isatty():
+        return True
+    answer = input(f"{prompt} [Y/n] ").strip().lower()
+    return answer in ("", "y", "yes")
+
+
+def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None = None,
+         patterns: list[str] | None = None, algorithm: str = "md5", assume_yes: bool = False,
+         overwrite: bool = False, quiet: bool = False) -> dict:
+    """Locate drive -> workbook -> data folder, then scan and fill in one go."""
+    # 1. Which drive?
+    if drive is None and excel is None and root is None:
+        drives = candidate_drives()
+        if not drives:
+            raise SystemExit("No external drive found. Plug it in, or pass --drive / --excel.")
+        if len(drives) > 1:
+            with_wb = [d for d in drives if find_geo_workbooks(d)]
+            if len(with_wb) == 1:
+                drives = with_wb
+            else:
+                listing = "\n".join(f"  {d}" for d in (with_wb or drives))
+                raise SystemExit(f"More than one external drive is attached; pick one with "
+                                 f"--drive:\n{listing}")
+        drive = drives[0]
+    if drive is not None and not drive.exists():
+        raise SystemExit(f"Drive not found: {drive}")
+
+    # 2. Which workbook?
+    if excel is None:
+        search_root = root or drive
+        workbooks = find_geo_workbooks(search_root)
+        if not workbooks:
+            raise SystemExit(f"No GEO metadata workbook (.xlsx with 'file name' and 'file "
+                             f"checksum' columns) found under {search_root}. Pass --excel.")
+        excel = _pick_workbook(workbooks)
+    if not excel.exists():
+        raise SystemExit(f"Workbook not found: {excel}")
+
+    # 3. Which folder holds the data files? Default: the folder the workbook lives in.
+    data_root = root or excel.parent
+    out_csv = excel.parent / "checksums.csv"
+
+    print(f"Drive:     {drive or '(not auto-detected)'}", file=sys.stderr)
+    print(f"Workbook:  {excel}", file=sys.stderr)
+    print(f"Data root: {data_root}", file=sys.stderr)
+    print(f"Checksums: {out_csv}", file=sys.stderr)
+    if not _confirm("Hash every data file under the data root and fill the workbook?", assume_yes):
+        raise SystemExit("Cancelled.")
+
+    records = scan(data_root, out_csv, patterns or DEFAULT_PATTERNS, algorithm,
+                   quiet=quiet, exclude=[excel, out_csv])
+    if not records:
+        raise SystemExit("No data files found; nothing written.")
+    write_checksum_csv(out_csv, records)
+    write_md5sum_file(excel.parent / "checksums.md5", records)
+    summary = fill_workbook(excel, records, overwrite=overwrite, quiet=quiet)
+    summary["workbook"] = excel
+    summary["csv"] = out_csv
+    return summary
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -448,6 +602,19 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("csv", type=Path, help="checksums.csv produced by 'scan'")
     f.add_argument("-q", "--quiet", action="store_true")
 
+    a = sub.add_parser("auto",
+                       help="Find the external drive and the GEO workbook on it, then scan and fill")
+    a.add_argument("--drive", type=Path, help="Mount point of the drive (default: auto-detect)")
+    a.add_argument("--excel", type=Path, help="Workbook to fill (default: search the drive)")
+    a.add_argument("--root", type=Path,
+                   help="Folder holding the data files (default: the workbook's folder)")
+    a.add_argument("--pattern", action="append", help="Glob for files to include (repeatable)")
+    a.add_argument("--algorithm", default="md5", choices=sorted(hashlib.algorithms_guaranteed))
+    a.add_argument("--overwrite", action="store_true",
+                   help="Replace checksums already present in the sheet")
+    a.add_argument("-y", "--yes", action="store_true", help="Do not ask for confirmation")
+    a.add_argument("-q", "--quiet", action="store_true")
+
     v = sub.add_parser("verify", help="Re-hash files and compare against a checksums CSV")
     v.add_argument("csv", type=Path, help="checksums.csv produced by 'scan'")
     v.add_argument("-q", "--quiet", action="store_true")
@@ -494,6 +661,15 @@ def cmd_fill(args) -> int:
     return 0 if not summary["missing"] else 2
 
 
+def cmd_auto(args) -> int:
+    summary = auto(drive=args.drive, excel=args.excel, root=args.root, patterns=args.pattern,
+                   algorithm=args.algorithm, assume_yes=args.yes, overwrite=args.overwrite,
+                   quiet=args.quiet)
+    print(f"Done. {len(summary['filled'])} checksum(s) written to {summary['workbook']}",
+          file=sys.stderr)
+    return 0 if not summary["missing"] else 2
+
+
 def cmd_verify(args) -> int:
     records = read_checksum_csv(args.csv)
     bad = 0
@@ -517,7 +693,8 @@ def cmd_verify(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return {"scan": cmd_scan, "fill": cmd_fill, "verify": cmd_verify}[args.command](args)
+        return {"scan": cmd_scan, "fill": cmd_fill, "verify": cmd_verify,
+                "auto": cmd_auto}[args.command](args)
     except KeyboardInterrupt:
         print("\nInterrupted. Progress so far is saved in the CSV; re-run to resume.",
               file=sys.stderr)

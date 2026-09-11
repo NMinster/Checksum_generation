@@ -178,3 +178,85 @@ def test_cli_end_to_end(drive, geo_workbook, tmp_path):
 
     # fill returns 2 when the sheet lists a file we have no checksum for
     assert gc.main(["fill", str(out), "--excel", str(geo_workbook), "--no-backup", "-q"]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# auto mode
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def fake_drive(tmp_path):
+    """An 'external drive' with the GEO workbook sitting next to the data files."""
+    drive = tmp_path / "Volumes" / "SEQDATA"
+    proj = drive / "GEO_submission"
+    (proj / "fastq").mkdir(parents=True)
+    (proj / "fastq" / "s1_R1.fastq.gz").write_bytes(b"AAAA" * 10)
+    (proj / "fastq" / "s1_R2.fastq.gz").write_bytes(b"CCCC" * 10)
+    (proj / "counts.txt").write_bytes(b"x")
+    (drive / "unrelated.xlsx").write_bytes(b"not a workbook")  # must be ignored
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["RAW FILES"])
+    ws.append(["file name", "file type", "file checksum"])
+    ws.append(["s1_R1.fastq.gz", "fastq", None])
+    ws.append(["s1_R2.fastq.gz", "fastq", None])
+    ws.append([])
+    ws.append(["PROCESSED DATA FILES"])
+    ws.append(["file name", "file type", "file checksum"])
+    ws.append(["counts.txt", "txt", None])
+    wb.save(proj / "GEO_metadata.xlsx")
+
+    wb2 = openpyxl.Workbook()
+    wb2.active.append(["Sample", "Notes"])
+    wb2.save(proj / "lab_notes.xlsx")  # xlsx without checksum columns: ignored
+    return drive
+
+
+def test_find_geo_workbooks(fake_drive):
+    found = gc.find_geo_workbooks(fake_drive)
+    assert [p.name for p in found] == ["GEO_metadata.xlsx"]
+
+
+def test_auto_detects_drive_and_fills_workbook(fake_drive, monkeypatch):
+    monkeypatch.setattr(gc, "candidate_drives", lambda: [fake_drive])
+    summary = gc.auto(assume_yes=True, quiet=True)
+    wb_path = fake_drive / "GEO_submission" / "GEO_metadata.xlsx"
+    assert summary["workbook"] == wb_path
+    assert len(summary["filled"]) == 3
+    assert summary["missing"] == []
+    # The GEO workbook itself is never hashed; other spreadsheets are (they may be
+    # processed data) and are merely reported as not listed in the sheet.
+    assert summary["unused"] == ["lab_notes.xlsx"]
+    ws = openpyxl.load_workbook(wb_path).active
+    assert ws["C3"].value == md5(b"AAAA" * 10)
+    assert ws["C8"].value == md5(b"x")
+    assert (wb_path.parent / "checksums.csv").exists()
+    assert (wb_path.parent / "checksums.md5").exists()
+    assert (wb_path.parent / "GEO_metadata.bak.xlsx").exists()
+
+
+def test_auto_no_drive(monkeypatch):
+    monkeypatch.setattr(gc, "candidate_drives", lambda: [])
+    with pytest.raises(SystemExit, match="No external drive"):
+        gc.auto(assume_yes=True, quiet=True)
+
+
+def test_auto_two_drives_picks_the_one_with_workbook(fake_drive, tmp_path, monkeypatch):
+    other = tmp_path / "Volumes" / "BACKUP"
+    other.mkdir()
+    monkeypatch.setattr(gc, "candidate_drives", lambda: [other, fake_drive])
+    summary = gc.auto(assume_yes=True, quiet=True)
+    assert summary["workbook"].parent.parent == fake_drive
+
+
+def test_auto_explicit_excel_skips_detection(fake_drive, monkeypatch):
+    monkeypatch.setattr(gc, "candidate_drives", lambda: (_ for _ in ()).throw(AssertionError))
+    wb_path = fake_drive / "GEO_submission" / "GEO_metadata.xlsx"
+    rc = gc.main(["auto", "--excel", str(wb_path), "-y", "-q"])
+    assert rc == 0
+
+
+def test_candidate_drives_runs_on_this_platform():
+    # Just make sure the platform-specific probing does not blow up.
+    assert isinstance(gc.candidate_drives(), list)
