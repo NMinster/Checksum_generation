@@ -47,6 +47,21 @@ The blocks can be stacked (as in the official GEO template) or side by side
 (RAW in columns A:B, PROCESSED in F:G). If the tab does not exist it is
 created with the side-by-side layout.
 
+Things it handles on a real drive:
+
+* **Workbook at the top of the drive** (for example `E:\Metadata for GEO
+  submission.xlsx` with the data files beside it): only the top-level files
+  are hashed, so unrelated backup folders on the same drive are skipped. The
+  skipped folders are listed; pass `--recursive` to include them.
+* **Fastq "files" that are really folders** (some download tools create a
+  folder named `X_R1_001.fastq.gz` with the file inside): the folder is
+  entered and the file inside is hashed under its own name. A note lists such
+  folders, since GEO needs the files, not the folders.
+* **Workbook open in Excel**: a warning is shown up front. If it is still open
+  when the hashing finishes, you are asked to close it and press Enter; if
+  nobody is there to answer, the result is saved as
+  `... (with checksums).xlsx` next to the original so nothing is lost.
+
 If you would rather keep the file names you typed and only have the checksums
 filled in next to them, use match mode:
 

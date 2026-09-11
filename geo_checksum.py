@@ -102,8 +102,22 @@ def hash_file(path: Path, algorithm: str = "md5", progress=None) -> str:
     return h.hexdigest()
 
 
+def looks_like_data_folder(p: Path) -> bool:
+    """True for a *directory* named like a data file, e.g. 'X_R1_001.fastq.gz/'.
+
+    Some download tools (BaseSpace, certain copy utilities) put each fastq inside
+    a folder that carries the file's name. The real file lives inside.
+    """
+    return p.is_dir() and RAW_FILE_RE.search(p.name) is not None
+
+
 def iter_data_files(root: Path, patterns: Iterable[str], recursive: bool = True) -> Iterator[Path]:
-    """Yield files under *root* whose name matches any of *patterns*."""
+    """Yield files under *root* whose name matches any of *patterns*.
+
+    With recursive=False only the top-level files are returned, plus the
+    contents of folders that are named like data files (see
+    looks_like_data_folder), so a folder-per-fastq layout still works.
+    """
     patterns = list(patterns)
     if root.is_file():
         yield root
@@ -112,12 +126,27 @@ def iter_data_files(root: Path, patterns: Iterable[str], recursive: bool = True)
         for p in sorted(root.iterdir()):
             if p.is_file() and _matches(p.name, patterns):
                 yield p
+            elif looks_like_data_folder(p):
+                yield from iter_data_files(p, patterns, recursive=True)
         return
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith(SKIP_DIR_PREFIXES))
         for name in sorted(filenames):
             if _matches(name, patterns):
                 yield Path(dirpath) / name
+
+
+def data_folders(root: Path, recursive: bool = True) -> list[Path]:
+    """Directories under *root* whose names look like data files."""
+    found = []
+    if not root.is_dir():
+        return found
+    if not recursive:
+        return [p for p in sorted(root.iterdir()) if looks_like_data_folder(p)]
+    for dirpath, dirnames, _ in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(SKIP_DIR_PREFIXES))
+        found.extend(Path(dirpath) / d for d in dirnames if RAW_FILE_RE.search(d))
+    return found
 
 
 def _matches(name: str, patterns: list[str]) -> bool:
@@ -188,6 +217,15 @@ def scan(root: Path, out_csv: Path | None, patterns: list[str], algorithm: str,
         for rec in read_checksum_csv(out_csv):
             if rec.algorithm == algorithm:
                 cached[rec.path] = rec
+
+    folders = data_folders(root, recursive=recursive)
+    if folders and not quiet:
+        print("NOTE: these are folders, not files, even though they are named like "
+              "sequencing files. The files inside them will be hashed under their own "
+              "names; GEO needs the files themselves, not the folders:", file=sys.stderr)
+        for d in folders:
+            inner = [p.name for p in sorted(d.iterdir()) if p.is_file()] if d.is_dir() else []
+            print(f"  {d}  ->  {', '.join(inner) or '(empty)'}", file=sys.stderr)
 
     files = [f for f in iter_data_files(root, patterns, recursive=recursive)
              if str(f.resolve()) not in excluded]
@@ -419,12 +457,40 @@ def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
         shutil.copy2(excel_path, bak)
         if not quiet:
             print(f"Backup saved to {bak}", file=sys.stderr)
-    wb.save(out)
+    out = _save_workbook(wb, out, quiet)
     if not quiet:
         print(f"Wrote {len(raw)} raw and {len(proc)} processed file(s) to "
               f"{out} [{ws.title}]", file=sys.stderr)
     return {"raw": [r.file_name for r in raw], "processed": [r.file_name for r in proc],
             "sheet": ws.title, "workbook": out}
+
+
+def excel_lock_file(excel_path: Path) -> Path | None:
+    """Return the '~$name.xlsx' lock file Excel keeps while a workbook is open."""
+    lock = excel_path.with_name("~$" + excel_path.name)
+    return lock if lock.exists() else None
+
+
+def _save_workbook(wb, out: Path, quiet: bool = False) -> Path:
+    """Save *wb* to *out*. If Excel has the file open (PermissionError on
+    Windows), ask the user to close it and retry; when nobody can answer, save
+    to a sibling file instead so the work is never lost. Returns the path used."""
+    for attempt in range(3):
+        try:
+            wb.save(out)
+            return out
+        except PermissionError:
+            if sys.stdin.isatty() and attempt < 2:
+                print(f"\nCannot write {out.name}: it is open in Excel (or read-only).",
+                      file=sys.stderr)
+                input("Close the workbook in Excel, then press Enter to retry... ")
+                continue
+            alt = out.with_name(f"{out.stem} (with checksums){out.suffix}")
+            wb.save(alt)
+            print(f"WARNING: {out.name} is open in Excel, so the result was saved as "
+                  f"{alt.name} instead. Close Excel and rename it, or re-run.", file=sys.stderr)
+            return alt
+    return out
 
 
 def _col_index(ws, spec: str) -> int:
@@ -504,7 +570,7 @@ def fill_workbook(excel_path: Path, records: list[ChecksumRecord], sheet: str | 
         shutil.copy2(excel_path, bak)
         if not quiet:
             print(f"Backup saved to {bak}", file=sys.stderr)
-    wb.save(out)
+    out = _save_workbook(wb, out, quiet)
 
     if not quiet:
         print(f"Wrote {len(filled)} checksum(s) to {out}"
@@ -611,7 +677,7 @@ def _confirm(prompt: str, assume_yes: bool) -> bool:
 def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None = None,
          patterns: list[str] | None = None, algorithm: str = "md5", assume_yes: bool = False,
          overwrite: bool = False, quiet: bool = False, mode: str = "populate",
-         sheet: str | None = None) -> dict:
+         sheet: str | None = None, recursive: bool | None = None) -> dict:
     """Locate drive -> workbook -> data folder, then scan and fill in one go."""
     # 1. Which drive?
     if drive is None and excel is None and root is None:
@@ -645,10 +711,37 @@ def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None
     data_root = root or excel.parent
     out_csv = excel.parent / "checksums.csv"
 
+    # If the workbook sits at the top of the drive, recursing would hash every
+    # backup folder on it. Default to top-level files only in that case.
+    resolved = data_root.resolve()
+    at_drive_root = resolved.parent == resolved  # e.g. E:\\ or /Volumes/X has no parent
+    if drive is not None and resolved == Path(drive).resolve():
+        at_drive_root = True
+    elif drive is None:
+        try:  # --excel given without --drive: still recognise a mount point
+            at_drive_root = at_drive_root or resolved in {d.resolve() for d in candidate_drives()}
+        except Exception:
+            pass
+    if recursive is None:
+        recursive = not at_drive_root
+
     print(f"Drive:     {drive or '(not auto-detected)'}", file=sys.stderr)
     print(f"Workbook:  {excel}", file=sys.stderr)
-    print(f"Data root: {data_root}", file=sys.stderr)
+    print(f"Data root: {data_root}" + ("" if recursive else "  (top-level files only)"),
+          file=sys.stderr)
     print(f"Checksums: {out_csv}", file=sys.stderr)
+    if at_drive_root and not recursive:
+        subdirs = [p.name for p in sorted(data_root.iterdir())
+                   if p.is_dir() and not p.name.startswith(SKIP_DIR_PREFIXES)
+                   and not looks_like_data_folder(p)]
+        if subdirs:
+            print("NOTE: the workbook is at the top of the drive, so subfolders are being "
+                  "skipped to avoid hashing unrelated backups: "
+                  + ", ".join(subdirs[:8]) + (" ..." if len(subdirs) > 8 else "")
+                  + ". Use --recursive to include them.", file=sys.stderr)
+    if excel_lock_file(excel):
+        print(f"NOTE: {excel.name} appears to be open in Excel. Close it before the scan "
+              f"finishes, otherwise the result is saved to a copy next to it.", file=sys.stderr)
     if mode == "populate":
         target_sheet = sheet or _checksum_sheet_name(excel)
         print(f"Sheet:     {target_sheet} (will be rebuilt from the files found)", file=sys.stderr)
@@ -659,7 +752,7 @@ def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None
         raise SystemExit("Cancelled.")
 
     records = scan(data_root, out_csv, patterns or DEFAULT_PATTERNS, algorithm,
-                   quiet=quiet, exclude=[excel, out_csv])
+                   recursive=recursive, quiet=quiet, exclude=[excel, out_csv])
     if not records:
         raise SystemExit("No data files found; nothing written.")
     write_checksum_csv(out_csv, records)
@@ -754,6 +847,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--root", type=Path,
                    help="Folder holding the data files (default: the workbook's folder)")
     a.add_argument("--pattern", action="append", help="Glob for files to include (repeatable)")
+    rec = a.add_mutually_exclusive_group()
+    rec.add_argument("--recursive", dest="recursive", action="store_true", default=None,
+                     help="Include subfolders (default unless the workbook is at the drive root)")
+    rec.add_argument("--no-recursive", dest="recursive", action="store_false",
+                     help="Top-level files only (folders named like fastq files are still read)")
     a.add_argument("--algorithm", default="md5", choices=sorted(hashlib.algorithms_guaranteed))
     a.add_argument("--mode", choices=["populate", "match"], default="populate",
                    help="populate (default): rebuild the checksum sheet with every file found; "
@@ -817,7 +915,8 @@ def cmd_fill(args) -> int:
 def cmd_auto(args) -> int:
     summary = auto(drive=args.drive, excel=args.excel, root=args.root, patterns=args.pattern,
                    algorithm=args.algorithm, assume_yes=args.yes, overwrite=args.overwrite,
-                   quiet=args.quiet, mode=args.mode, sheet=args.sheet)
+                   quiet=args.quiet, mode=args.mode, sheet=args.sheet,
+                   recursive=args.recursive)
     print(f"Done. {len(summary['filled'])} checksum(s) written to {summary['workbook']}",
           file=sys.stderr)
     return 0 if not summary["missing"] else 2

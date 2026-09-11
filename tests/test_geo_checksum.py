@@ -368,3 +368,78 @@ def test_is_raw_file():
     assert gc.is_raw_file("x.fastq") and gc.is_raw_file("x.fq.gz") and gc.is_raw_file("x.BAM")
     assert not gc.is_raw_file("x.h5") and not gc.is_raw_file("x.json")
     assert not gc.is_raw_file("x.fastq.md5")
+
+
+# --------------------------------------------------------------------------- #
+# real-world drive quirks
+# --------------------------------------------------------------------------- #
+
+def test_folder_named_like_fastq_is_descended(tmp_path, capsys):
+    root = tmp_path / "data"
+    d = root / "H4_S1_L002_R1_001.fastq.gz"
+    d.mkdir(parents=True)
+    (d / "H4_S1_L002_R1_001.fastq.gz").write_bytes(b"reads")
+    (root / "H4_scalefactors_json.json").write_bytes(b"{}")
+    (root / "other_folder").mkdir()
+    (root / "other_folder" / "ignored.txt").write_bytes(b"x")
+
+    records = gc.scan(root, None, gc.DEFAULT_PATTERNS, "md5", recursive=False)
+    assert sorted(r.file_name for r in records) == ["H4_S1_L002_R1_001.fastq.gz",
+                                                    "H4_scalefactors_json.json"]
+    err = capsys.readouterr().err
+    assert "folders, not files" in err and "H4_S1_L002_R1_001.fastq.gz" in err
+
+
+def test_save_falls_back_when_workbook_open_in_excel(side_by_side_workbook, monkeypatch):
+    import openpyxl.workbook.workbook as wbmod
+    real_save = wbmod.Workbook.save
+    target = str(side_by_side_workbook)
+
+    def locked_save(self, filename):
+        if str(filename) == target:
+            raise PermissionError(13, "Permission denied", target)
+        return real_save(self, filename)
+
+    monkeypatch.setattr(wbmod.Workbook, "save", locked_save)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    summary = gc.populate_workbook(side_by_side_workbook, _records(["a_R1.fastq"]),
+                                   quiet=True, backup=False)
+    alt = side_by_side_workbook.with_name("Metadata for GEO submission (with checksums).xlsx")
+    assert summary["workbook"] == alt and alt.exists()
+    assert openpyxl.load_workbook(alt)["MD5 Checksums"]["A5"].value == "a_R1.fastq"
+
+
+def test_excel_lock_file_detection(side_by_side_workbook):
+    assert gc.excel_lock_file(side_by_side_workbook) is None
+    lock = side_by_side_workbook.with_name("~$" + side_by_side_workbook.name)
+    lock.write_bytes(b"")
+    assert gc.excel_lock_file(side_by_side_workbook) == lock
+    # and the lock file is never treated as a workbook or hashed
+    assert gc.find_geo_workbooks(side_by_side_workbook.parent) == [side_by_side_workbook]
+    assert not gc._matches(lock.name, ["*"])
+
+
+def test_auto_at_drive_root_skips_unrelated_folders(tmp_path, monkeypatch, capsys):
+    drive = tmp_path / "E"
+    (drive / "Old Backups").mkdir(parents=True)
+    (drive / "Old Backups" / "photo.jpg").write_bytes(b"jpg")
+    (drive / "H4_S1_L002_R1_001.fastq.gz").write_bytes(b"reads")
+    (drive / "H4_tissue_positions.parquet").write_bytes(b"pq")
+    wb = openpyxl.Workbook()
+    wb.active.title = "Metadata"
+    ws = wb.create_sheet("MD5 Checksums")
+    ws["A3"] = "RAW FILES"; ws["A4"], ws["B4"] = "file name", "file checksum"
+    ws["F4"] = "PROCESSED DATA FILES"; ws["F5"], ws["G5"] = "file name", "file checksum"
+    wb.save(drive / "Metadata for GEO submission.xlsx")
+    (drive / "~$Metadata for GEO submission.xlsx").write_bytes(b"")
+    monkeypatch.setattr(gc, "candidate_drives", lambda: [drive])
+
+    summary = gc.auto(assume_yes=True, quiet=True)
+    assert summary["raw"] == ["H4_S1_L002_R1_001.fastq.gz"]
+    assert summary["processed"] == ["H4_tissue_positions.parquet"]  # photo.jpg not hashed
+    err = capsys.readouterr().err
+    assert "Old Backups" in err and "--recursive" in err
+    assert "open in Excel" in err
+
+    summary = gc.auto(assume_yes=True, quiet=True, recursive=True)
+    assert "photo.jpg" in summary["processed"]
