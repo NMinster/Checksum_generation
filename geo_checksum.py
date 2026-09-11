@@ -660,9 +660,18 @@ def find_geo_workbooks(root: Path, max_depth: int = WORKBOOK_SEARCH_DEPTH) -> li
 def _pick_workbook(workbooks: list[Path]) -> Path:
     if len(workbooks) == 1:
         return workbooks[0]
-    preferred = [w for w in workbooks if re.search(r"geo|metadata|template", w.name, re.I)]
-    if len(preferred) == 1:
-        return preferred[0]
+    def score(w: Path) -> int:
+        n = 0
+        if re.search(r"geo", w.name, re.I):
+            n += 4
+        if re.search(r"metadata|template|submission", w.name, re.I):
+            n += 2
+        if re.search(r"geo", w.parent.name, re.I):  # e.g. "GEO submission_spatial"
+            n += 3
+        return n
+    ranked = sorted(workbooks, key=score, reverse=True)
+    if score(ranked[0]) > 0 and (len(ranked) == 1 or score(ranked[0]) > score(ranked[1])):
+        return ranked[0]
     listing = "\n".join(f"  {w}" for w in workbooks)
     raise SystemExit(f"Found more than one GEO-style workbook; pick one with --excel:\n{listing}")
 

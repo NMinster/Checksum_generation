@@ -443,3 +443,12 @@ def test_auto_at_drive_root_skips_unrelated_folders(tmp_path, monkeypatch, capsy
 
     summary = gc.auto(assume_yes=True, quiet=True, recursive=True)
     assert "photo.jpg" in summary["processed"]
+
+
+def test_pick_workbook_prefers_geo_folder(tmp_path):
+    a = tmp_path / "Old Backups" / "sample inventory.xlsx"
+    b = tmp_path / "GEO submission_spatial" / "Metadata for GEO submission.xlsx"
+    assert gc._pick_workbook([a, b]) == b
+    c = tmp_path / "GEO submission_spatial" / "Metadata for GEO submission (with checksums).xlsx"
+    with pytest.raises(SystemExit, match="more than one"):
+        gc._pick_workbook([b, c])

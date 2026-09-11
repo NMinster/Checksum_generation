@@ -69,6 +69,15 @@ filled in next to them, use match mode:
 python geo_checksum.py auto --mode match
 ```
 
+For a drive laid out like `E:\GEO submission_spatial\Metadata for GEO
+submission.xlsx` with the fastq, h5, json, parquet and png files in that same
+folder, no options are needed: the workbook is found, that folder becomes the
+data root, and the `MD5 Checksums` tab is rebuilt. To be explicit anyway:
+
+```bat
+python geo_checksum.py auto --excel "E:\GEO submission_spatial\Metadata for GEO submission.xlsx"
+```
+
 If more than one drive or more than one candidate workbook is found, it stops
 and tells you which ones, and you can point it at the right one:
 
