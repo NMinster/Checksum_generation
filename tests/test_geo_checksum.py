@@ -223,14 +223,26 @@ def test_auto_detects_drive_and_fills_workbook(fake_drive, monkeypatch):
     summary = gc.auto(assume_yes=True, quiet=True)
     wb_path = fake_drive / "GEO_submission" / "GEO_metadata.xlsx"
     assert summary["workbook"] == wb_path
-    assert len(summary["filled"]) == 3
-    assert summary["missing"] == []
-    # The GEO workbook itself is never hashed; other spreadsheets are (they may be
-    # processed data) and are merely reported as not listed in the sheet.
-    assert summary["unused"] == ["lab_notes.xlsx"]
+    # Default mode rebuilds the sheet: fastq files under RAW, everything else
+    # (including lab_notes.xlsx, which may be processed data) under PROCESSED.
+    assert summary["raw"] == ["s1_R1.fastq.gz", "s1_R2.fastq.gz"]
+    assert summary["processed"] == ["counts.txt", "lab_notes.xlsx"]
     ws = openpyxl.load_workbook(wb_path).active
-    assert ws["C3"].value == md5(b"AAAA" * 10)
-    assert ws["C8"].value == md5(b"x")
+    assert ws["A3"].value == "s1_R1.fastq.gz" and ws["C3"].value == md5(b"AAAA" * 10)
+    assert ws["A4"].value == "s1_R2.fastq.gz"
+    assert ws["A8"].value == "counts.txt" and ws["C8"].value == md5(b"x")
+    assert ws["A9"].value == "lab_notes.xlsx"
+
+    # match mode only fills checksums next to names already present
+    ws["A9"].value = None
+    ws["C3"].value = ws["C4"].value = ws["C8"].value = None
+    openpyxl.load_workbook(wb_path)  # sanity
+    wb = openpyxl.load_workbook(wb_path)
+    wb.active["C3"].value = None
+    wb.save(wb_path)
+    summary = gc.auto(assume_yes=True, quiet=True, mode="match")
+    assert {n for _, _, n in summary["filled"]} == {"s1_R1.fastq.gz"}
+    assert summary["missing"] == []
     assert (wb_path.parent / "checksums.csv").exists()
     assert (wb_path.parent / "checksums.md5").exists()
     assert (wb_path.parent / "GEO_metadata.bak.xlsx").exists()
@@ -260,3 +272,99 @@ def test_auto_explicit_excel_skips_detection(fake_drive, monkeypatch):
 def test_candidate_drives_runs_on_this_platform():
     # Just make sure the platform-specific probing does not blow up.
     assert isinstance(gc.candidate_drives(), list)
+
+
+# --------------------------------------------------------------------------- #
+# populate mode, side-by-side layout as in the real "MD5 Checksums" tab
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def side_by_side_workbook(tmp_path):
+    """RAW FILES in A:B (header row 4), PROCESSED DATA FILES in F:G (header row 5),
+    with stale entries that must be replaced."""
+    wb = openpyxl.Workbook()
+    wb.active.title = "Metadata"
+    ws = wb.create_sheet("MD5 Checksums")
+    ws["A3"] = "RAW FILES"
+    ws["A4"], ws["B4"] = "file name", "file checksum"
+    ws["A5"], ws["B5"] = "old_R1.fastq", "0" * 32
+    ws["A6"], ws["B6"] = "old_R2.fastq", "1" * 32
+    ws["F4"] = "PROCESSED DATA FILES"
+    ws["F5"], ws["G5"] = "file name", "file checksum"
+    ws["F6"], ws["G6"] = "old_matrix.h5", "2" * 32
+    path = tmp_path / "Metadata for GEO submission.xlsx"
+    wb.save(path)
+    return path
+
+
+def _records(names):
+    return [gc.ChecksumRecord(n, md5(n.encode()), "md5", 1, 0.0, f"/drive/{n}") for n in names]
+
+
+def test_populate_side_by_side(side_by_side_workbook):
+    names = ["CG3_S1_L001_R1_001.fastq", "CG3_S1_L001_R2_001.fastq", "C4_S1_L002_R1_001.fastq",
+             "CG3_filtered_feature_bc_matrix.h5", "CG3_scalefactors_json.json",
+             "CG3_tissue_positions.csv", "CG3_tissue_hires_image.png"]
+    summary = gc.populate_workbook(side_by_side_workbook, _records(names), quiet=True, backup=False)
+    assert summary["sheet"] == "MD5 Checksums"
+    assert summary["raw"] == ["C4_S1_L002_R1_001.fastq", "CG3_S1_L001_R1_001.fastq",
+                              "CG3_S1_L001_R2_001.fastq"]
+    assert len(summary["processed"]) == 4
+
+    wb = openpyxl.load_workbook(side_by_side_workbook)
+    assert wb.sheetnames == ["Metadata", "MD5 Checksums"]
+    ws = wb["MD5 Checksums"]
+    # headers and titles untouched
+    assert ws["A3"].value == "RAW FILES" and ws["A4"].value == "file name"
+    assert ws["F4"].value == "PROCESSED DATA FILES" and ws["G5"].value == "file checksum"
+    # raw block rewritten from row 5
+    assert ws["A5"].value == "C4_S1_L002_R1_001.fastq"
+    assert ws["B5"].value == md5(b"C4_S1_L002_R1_001.fastq")
+    assert ws["A7"].value == "CG3_S1_L001_R2_001.fastq"
+    assert ws["A8"].value is None  # stale rows gone
+    # processed block rewritten from row 6
+    assert ws["F6"].value == "CG3_filtered_feature_bc_matrix.h5"
+    assert ws["G6"].value == md5(b"CG3_filtered_feature_bc_matrix.h5")
+    assert ws["F9"].value == "CG3_tissue_positions.csv"
+    assert ws["F10"].value is None
+    # nothing was written between the blocks
+    assert all(ws.cell(row=r, column=c).value is None for r in range(5, 12) for c in (3, 4, 5))
+
+
+def test_match_mode_side_by_side(side_by_side_workbook):
+    records = _records(["old_R1.fastq", "old_R2.fastq", "old_matrix.h5"])
+    summary = gc.fill_workbook(side_by_side_workbook, records, quiet=True, backup=False,
+                               overwrite=True)
+    assert {n for _, _, n in summary["filled"]} == {"old_R1.fastq", "old_R2.fastq", "old_matrix.h5"}
+    assert summary["missing"] == []
+    ws = openpyxl.load_workbook(side_by_side_workbook)["MD5 Checksums"]
+    assert ws["B6"].value == md5(b"old_R2.fastq")
+    assert ws["G6"].value == md5(b"old_matrix.h5")
+
+
+def test_populate_creates_sheet_when_missing(tmp_path):
+    wb = openpyxl.Workbook()
+    wb.active.title = "Metadata"
+    path = tmp_path / "Metadata for GEO submission.xlsx"
+    wb.save(path)
+    gc.populate_workbook(path, _records(["a_R1.fastq.gz", "b.txt"]), quiet=True, backup=False)
+    ws = openpyxl.load_workbook(path)["MD5 Checksums"]
+    assert ws["A3"].value == "RAW FILES" and ws["A5"].value == "a_R1.fastq.gz"
+    assert ws["F3"].value == "PROCESSED DATA FILES" and ws["F5"].value == "b.txt"
+
+
+def test_populate_stacked_layout_grows_without_clobbering(geo_workbook):
+    # Stacked GEO template: 3 raw slots, then PROCESSED block. Writing 5 raw files
+    # must push the processed block down rather than overwrite it.
+    names = [f"s{i}_R1.fastq.gz" for i in range(5)] + ["counts.txt"]
+    gc.populate_workbook(geo_workbook, _records(names), sheet="Metadata", quiet=True, backup=False)
+    ws = openpyxl.load_workbook(geo_workbook)["Metadata"]
+    col_a = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+    assert col_a.index("PROCESSED DATA FILES") > col_a.index("s4_R1.fastq.gz")
+    assert col_a[col_a.index("PROCESSED DATA FILES") + 2] == "counts.txt"
+
+
+def test_is_raw_file():
+    assert gc.is_raw_file("x.fastq") and gc.is_raw_file("x.fq.gz") and gc.is_raw_file("x.BAM")
+    assert not gc.is_raw_file("x.h5") and not gc.is_raw_file("x.json")
+    assert not gc.is_raw_file("x.fastq.md5")

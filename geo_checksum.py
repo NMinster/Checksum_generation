@@ -45,20 +45,19 @@ from typing import Iterable, Iterator
 
 __version__ = "1.0.0"
 
-# File types GEO typically wants checksums for. Used when --pattern is not given.
-DEFAULT_PATTERNS = [
-    "*.fastq", "*.fastq.gz", "*.fq", "*.fq.gz",
-    "*.bam", "*.cram", "*.sra",
-    "*.bw", "*.bigwig", "*.bigWig", "*.bedgraph", "*.bedGraph", "*.bedgraph.gz",
-    "*.bed", "*.bed.gz", "*.narrowPeak", "*.broadPeak", "*.gtf", "*.gtf.gz",
-    "*.h5", "*.h5ad", "*.mtx", "*.mtx.gz", "*.loom",
-    "*.txt", "*.txt.gz", "*.tsv", "*.tsv.gz", "*.csv", "*.csv.gz", "*.xlsx",
-    "*.tar", "*.tar.gz", "*.tgz", "*.zip",
-]
+# Everything in a GEO submission folder is data unless it is obvious junk, so by
+# default every file is hashed. Use --pattern to narrow this down.
+DEFAULT_PATTERNS = ["*"]
 
 # Files that are never data files and should not be hashed.
-SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini", "checksums.csv", "checksums.md5"}
+SKIP_SUFFIXES = (".bak.xlsx", ".docx", ".doc", ".pptx", ".ppt", ".lnk", ".ini", ".db",
+                 ".tmp", ".part", ".crdownload")
 SKIP_DIR_PREFIXES = (".", "$RECYCLE.BIN", "System Volume Information")
+
+# Files GEO counts as raw data; everything else goes under PROCESSED DATA FILES.
+RAW_FILE_RE = re.compile(
+    r"\.(fastq|fq|bam|cram|sra|bcl|ubam|fast5|pod5)(\.gz|\.bz2|\.zst)?$", re.IGNORECASE)
 
 CSV_FIELDS = ["file_name", "checksum", "algorithm", "size_bytes", "mtime", "path"]
 
@@ -124,8 +123,8 @@ def iter_data_files(root: Path, patterns: Iterable[str], recursive: bool = True)
 def _matches(name: str, patterns: list[str]) -> bool:
     if name in SKIP_NAMES or name.startswith("._") or name.startswith("~$"):
         return False
-    if name.endswith(".bak.xlsx") or name == "checksums.csv":
-        return False
+    if "*" in patterns and name.lower().endswith(SKIP_SUFFIXES):
+        return False  # only when hashing "everything"; an explicit --pattern wins
     return any(fnmatch.fnmatch(name, pat) for pat in patterns)
 
 
@@ -264,7 +263,7 @@ FILE_NAME_HEADER = re.compile(r"^\s*file\s*name\s*$", re.IGNORECASE)
 CHECKSUM_HEADER = re.compile(r"checksum|md5", re.IGNORECASE)
 
 
-@dataclass
+@dataclass(eq=False)
 class Section:
     """A block in the sheet with a 'file name' column and a 'checksum' column."""
     header_row: int
@@ -292,6 +291,140 @@ def find_sections(ws) -> list[Section]:
         if name_col is not None and checksum_col is not None:
             sections.append(Section(header_row, name_col, checksum_col))
     return sections
+
+
+def iter_section_names(ws, section: Section, all_sections: list[Section]):
+    """Yield (row, file name) for the data cells below *section*'s header.
+
+    Sections may be stacked (GEO template) or side by side (one block in A:B and
+    another in F:G), so each section walks only its own name column. A section
+    title such as "PROCESSED DATA FILES" sitting directly above another header in
+    the same column is skipped.
+    """
+    title_rows = {s.header_row - 1 for s in all_sections if s.name_col == section.name_col}
+    for row_idx in range(section.header_row + 1, ws.max_row + 1):
+        if row_idx in title_rows:
+            continue
+        raw = ws.cell(row=row_idx, column=section.name_col).value
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        name = raw.strip()
+        if FILE_NAME_HEADER.match(name) or SECTION_TITLE_RE.search(name):
+            continue
+        yield row_idx, name
+
+
+SECTION_TITLE_RE = re.compile(r"^\s*(raw|processed)\b.*files\s*$", re.IGNORECASE)
+
+
+def section_kind(ws, section: Section) -> str | None:
+    """Return 'raw' or 'processed' from the title near the section header, if any."""
+    for r in range(max(1, section.header_row - 3), section.header_row + 1):
+        for c in range(section.name_col, section.checksum_col + 1):
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, str):
+                if re.search(r"\braw\b", v, re.IGNORECASE):
+                    return "raw"
+                if re.search(r"\bprocessed\b", v, re.IGNORECASE):
+                    return "processed"
+    return None
+
+
+def is_raw_file(name: str) -> bool:
+    return RAW_FILE_RE.search(name) is not None
+
+
+def _natural_key(name: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def _default_layout(ws) -> list[Section]:
+    """Create the RAW / PROCESSED blocks side by side on an empty sheet."""
+    from openpyxl.styles import Font
+    bold = Font(bold=True)
+    ws["A3"], ws["A3"].font = "RAW FILES", bold
+    ws["A4"], ws["B4"] = "file name", "file checksum"
+    ws["F3"], ws["F3"].font = "PROCESSED DATA FILES", bold
+    ws["F4"], ws["G4"] = "file name", "file checksum"
+    for cell in ("A4", "B4", "F4", "G4"):
+        ws[cell].font = bold
+    ws.column_dimensions["A"].width = 40
+    ws.column_dimensions["B"].width = 36
+    ws.column_dimensions["F"].width = 40
+    ws.column_dimensions["G"].width = 36
+    return [Section(4, 1, 2), Section(4, 6, 7)]
+
+
+def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
+                      sheet: str = "MD5 Checksums", output: Path | None = None,
+                      backup: bool = True, quiet: bool = False) -> dict:
+    """Rebuild *sheet* from the scanned files: clear the RAW FILES and PROCESSED
+    DATA FILES blocks and write every file name with its checksum.
+
+    Raw files (fastq, bam, ...) go under RAW FILES, everything else under
+    PROCESSED DATA FILES. The header rows and titles already in the sheet are
+    kept; if the sheet is missing or empty, the standard layout is created.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        raise SystemExit("openpyxl is required for Excel support: pip install openpyxl")
+    if not excel_path.exists():
+        raise SystemExit(f"Excel file not found: {excel_path}")
+
+    wb = openpyxl.load_workbook(excel_path)
+    ws = wb[sheet] if sheet in wb.sheetnames else wb.create_sheet(sheet)
+    sections = find_sections(ws)
+    if not sections:
+        sections = _default_layout(ws)
+
+    raw_sec = next((sec for sec in sections if section_kind(ws, sec) == "raw"), None)
+    proc_sec = next((sec for sec in sections if section_kind(ws, sec) == "processed"), None)
+    if raw_sec is None or proc_sec is None:
+        # Unlabelled blocks: first is raw, second is processed.
+        ordered = sorted(sections, key=lambda sec: (sec.header_row, sec.name_col))
+        raw_sec = raw_sec or ordered[0]
+        proc_sec = proc_sec or (ordered[1] if len(ordered) > 1 else ordered[0])
+
+    # Wipe old entries below each header (only the name / checksum columns).
+    for sec in {raw_sec, proc_sec}:
+        for row_idx, _ in list(iter_section_names(ws, sec, sections)):
+            ws.cell(row=row_idx, column=sec.name_col).value = None
+            ws.cell(row=row_idx, column=sec.checksum_col).value = None
+
+    raw = sorted((r for r in records if is_raw_file(r.file_name)),
+                 key=lambda r: _natural_key(r.file_name))
+    proc = sorted((r for r in records if not is_raw_file(r.file_name)),
+                  key=lambda r: _natural_key(r.file_name))
+    if raw_sec is proc_sec:
+        raw, proc = raw + proc, []
+
+    for sec, recs in ((raw_sec, raw), (proc_sec, proc)):
+        row_idx = sec.header_row + 1
+        for rec in recs:
+            # Do not run into another block stacked below this one.
+            while any(row_idx in (o.header_row - 1, o.header_row) for o in sections
+                      if o is not sec and o.name_col == sec.name_col):
+                ws.insert_rows(row_idx)
+                for o in sections:
+                    if o.header_row >= row_idx:
+                        o.header_row += 1
+            ws.cell(row=row_idx, column=sec.name_col).value = rec.file_name
+            ws.cell(row=row_idx, column=sec.checksum_col).value = rec.checksum
+            row_idx += 1
+
+    out = output or excel_path
+    if out == excel_path and backup:
+        bak = excel_path.with_name(excel_path.stem + ".bak" + excel_path.suffix)
+        shutil.copy2(excel_path, bak)
+        if not quiet:
+            print(f"Backup saved to {bak}", file=sys.stderr)
+    wb.save(out)
+    if not quiet:
+        print(f"Wrote {len(raw)} raw and {len(proc)} processed file(s) to "
+              f"{out} [{ws.title}]", file=sys.stderr)
+    return {"raw": [r.file_name for r in raw], "processed": [r.file_name for r in proc],
+            "sheet": ws.title, "workbook": out}
 
 
 def _col_index(ws, spec: str) -> int:
@@ -340,48 +473,28 @@ def fill_workbook(excel_path: Path, records: list[ChecksumRecord], sheet: str | 
             sections = [Section(0, _col_index(ws, name_col), _col_index(ws, checksum_col))]
         else:
             sections = find_sections(ws)
-        if not sections:
-            continue
-        # Assign each data row to the nearest section header above it.
-        sections.sort(key=lambda s: s.header_row)
-        header_rows = {s.header_row for s in sections}
-        for row_idx in range(1, ws.max_row + 1):
-            section = None
-            for s in sections:
-                if s.header_row < row_idx:
-                    section = s
-            if section is None:
-                continue
-            # The GEO template puts a section title (e.g. "PROCESSED DATA FILES")
-            # on the row directly above each header row; that is not a file name.
-            if row_idx + 1 in header_rows:
-                continue
-            name_cell = ws.cell(row=row_idx, column=section.name_col)
-            raw = name_cell.value
-            if not isinstance(raw, str) or not raw.strip():
-                continue
-            name = raw.strip()
-            if FILE_NAME_HEADER.match(name):
-                continue
-            # Allow the sheet to contain a path; GEO only needs the base name.
-            base = Path(name.replace("\\", "/")).name
-            rec = by_name.get(base) or by_name_ci.get(base.lower())
-            if rec is None:
-                missing.append((ws.title, row_idx, name))
-                continue
-            used.add(rec.file_name)
-            target = ws.cell(row=row_idx, column=section.checksum_col)
-            existing = target.value
-            if existing not in (None, "") and str(existing).strip() and not overwrite:
-                if str(existing).strip().lower() == rec.checksum.lower():
-                    unchanged.append((ws.title, row_idx, name))
-                else:
-                    print(f"WARNING: {ws.title}!{target.coordinate} already has a different "
-                          f"checksum for {name}; use --overwrite to replace it.", file=sys.stderr)
+        for section in sections:
+            for row_idx, name in iter_section_names(ws, section, sections):
+                # Allow the sheet to contain a path; GEO only needs the base name.
+                base = Path(name.replace("\\", "/")).name
+                rec = by_name.get(base) or by_name_ci.get(base.lower())
+                if rec is None:
                     missing.append((ws.title, row_idx, name))
-                continue
-            target.value = rec.checksum
-            filled.append((ws.title, row_idx, name))
+                    continue
+                used.add(rec.file_name)
+                target = ws.cell(row=row_idx, column=section.checksum_col)
+                existing = target.value
+                if existing not in (None, "") and str(existing).strip() and not overwrite:
+                    if str(existing).strip().lower() == rec.checksum.lower():
+                        unchanged.append((ws.title, row_idx, name))
+                    else:
+                        print(f"WARNING: {ws.title}!{target.coordinate} already has a different "
+                              f"checksum for {name}; use --overwrite to replace it.",
+                              file=sys.stderr)
+                        missing.append((ws.title, row_idx, name))
+                    continue
+                target.value = rec.checksum
+                filled.append((ws.title, row_idx, name))
 
     unused = sorted(set(by_name) - used)
 
@@ -497,7 +610,8 @@ def _confirm(prompt: str, assume_yes: bool) -> bool:
 
 def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None = None,
          patterns: list[str] | None = None, algorithm: str = "md5", assume_yes: bool = False,
-         overwrite: bool = False, quiet: bool = False) -> dict:
+         overwrite: bool = False, quiet: bool = False, mode: str = "populate",
+         sheet: str | None = None) -> dict:
     """Locate drive -> workbook -> data folder, then scan and fill in one go."""
     # 1. Which drive?
     if drive is None and excel is None and root is None:
@@ -535,7 +649,13 @@ def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None
     print(f"Workbook:  {excel}", file=sys.stderr)
     print(f"Data root: {data_root}", file=sys.stderr)
     print(f"Checksums: {out_csv}", file=sys.stderr)
-    if not _confirm("Hash every data file under the data root and fill the workbook?", assume_yes):
+    if mode == "populate":
+        target_sheet = sheet or _checksum_sheet_name(excel)
+        print(f"Sheet:     {target_sheet} (will be rebuilt from the files found)", file=sys.stderr)
+        question = "Hash every data file under the data root and rebuild that sheet?"
+    else:
+        question = "Hash every data file under the data root and fill in the checksums?"
+    if not _confirm(question, assume_yes):
         raise SystemExit("Cancelled.")
 
     records = scan(data_root, out_csv, patterns or DEFAULT_PATTERNS, algorithm,
@@ -544,10 +664,32 @@ def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None
         raise SystemExit("No data files found; nothing written.")
     write_checksum_csv(out_csv, records)
     write_md5sum_file(excel.parent / "checksums.md5", records)
-    summary = fill_workbook(excel, records, overwrite=overwrite, quiet=quiet)
+    if mode == "populate":
+        summary = populate_workbook(excel, records, sheet=target_sheet, quiet=quiet)
+        summary["missing"] = []
+        summary["filled"] = summary["raw"] + summary["processed"]
+    else:
+        summary = fill_workbook(excel, records, sheet=sheet, overwrite=overwrite, quiet=quiet)
     summary["workbook"] = excel
     summary["csv"] = out_csv
     return summary
+
+
+def _checksum_sheet_name(excel: Path) -> str:
+    """Pick the sheet to rebuild: one named like 'MD5 Checksums', else the first
+    sheet that already has file name / checksum columns, else a new sheet."""
+    import openpyxl
+    wb = openpyxl.load_workbook(excel, read_only=True)
+    try:
+        for name in wb.sheetnames:
+            if re.search(r"checksum|md5", name, re.IGNORECASE):
+                return name
+        for ws in wb.worksheets:
+            if find_sections(ws):
+                return ws.title
+    finally:
+        wb.close()
+    return "MD5 Checksums"
 
 
 # --------------------------------------------------------------------------- #
@@ -600,6 +742,9 @@ def build_parser() -> argparse.ArgumentParser:
     f = sub.add_parser("fill", parents=[excel_opts],
                        help="Write checksums from a CSV (made by 'scan') into an Excel sheet")
     f.add_argument("csv", type=Path, help="checksums.csv produced by 'scan'")
+    f.add_argument("--populate", action="store_true",
+                   help="Rebuild the sheet with every file in the CSV instead of matching "
+                        "names already present (default sheet: 'MD5 Checksums')")
     f.add_argument("-q", "--quiet", action="store_true")
 
     a = sub.add_parser("auto",
@@ -610,8 +755,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Folder holding the data files (default: the workbook's folder)")
     a.add_argument("--pattern", action="append", help="Glob for files to include (repeatable)")
     a.add_argument("--algorithm", default="md5", choices=sorted(hashlib.algorithms_guaranteed))
+    a.add_argument("--mode", choices=["populate", "match"], default="populate",
+                   help="populate (default): rebuild the checksum sheet with every file found; "
+                        "match: only fill checksums next to file names already in the sheet")
+    a.add_argument("--sheet", help="Sheet to rebuild / fill (default: the 'MD5 Checksums' tab)")
     a.add_argument("--overwrite", action="store_true",
-                   help="Replace checksums already present in the sheet")
+                   help="match mode: replace checksums already present in the sheet")
     a.add_argument("-y", "--yes", action="store_true", help="Do not ask for confirmation")
     a.add_argument("-q", "--quiet", action="store_true")
 
@@ -657,6 +806,10 @@ def cmd_fill(args) -> int:
     records = read_checksum_csv(args.csv)
     if not records:
         raise SystemExit(f"No checksums found in {args.csv}")
+    if args.populate:
+        populate_workbook(args.excel, records, sheet=args.sheet or _checksum_sheet_name(args.excel),
+                          output=args.output, backup=not args.no_backup, quiet=args.quiet)
+        return 0
     summary = fill_workbook(args.excel, records, **_excel_kwargs(args))
     return 0 if not summary["missing"] else 2
 
@@ -664,7 +817,7 @@ def cmd_fill(args) -> int:
 def cmd_auto(args) -> int:
     summary = auto(drive=args.drive, excel=args.excel, root=args.root, patterns=args.pattern,
                    algorithm=args.algorithm, assume_yes=args.yes, overwrite=args.overwrite,
-                   quiet=args.quiet)
+                   quiet=args.quiet, mode=args.mode, sheet=args.sheet)
     print(f"Done. {len(summary['filled'])} checksum(s) written to {summary['workbook']}",
           file=sys.stderr)
     return 0 if not summary["missing"] else 2

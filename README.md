@@ -31,12 +31,28 @@ The tool then
 1. finds the attached external drive (`/Volumes/*` on macOS, non-system drive
    letters on Windows, `/media` and `/run/media` on Linux),
 2. searches it for an `.xlsx` that has `file name` and `file checksum` columns,
-   which is how it recognises the GEO metadata template,
+   which is how it recognises the GEO workbook (for example
+   `Metadata for GEO submission.xlsx`),
 3. shows you what it found and asks for confirmation,
-4. hashes every data file in the workbook's folder, saving progress to
-   `checksums.csv` next to the workbook so an interrupted run can resume,
-5. writes the checksums into the workbook in place, keeping a `.bak` copy, and
-   lists any file names in the sheet it could not match.
+4. hashes every file in the workbook's folder and subfolders, saving progress
+   to `checksums.csv` next to the workbook so an interrupted run can resume,
+5. rebuilds the `MD5 Checksums` tab: the **RAW FILES** block gets every
+   sequencing file (`.fastq`, `.fq`, `.bam`, `.cram`, `.sra`, gzipped or not)
+   and the **PROCESSED DATA FILES** block gets everything else (`.h5`, `.json`,
+   `.csv`, `.png`, ...), each as a file name plus its MD5. Old entries in those
+   two blocks are cleared first, titles and header rows are kept, the other
+   tabs are untouched, and a `.bak` copy of the workbook is saved.
+
+The blocks can be stacked (as in the official GEO template) or side by side
+(RAW in columns A:B, PROCESSED in F:G). If the tab does not exist it is
+created with the side-by-side layout.
+
+If you would rather keep the file names you typed and only have the checksums
+filled in next to them, use match mode:
+
+```bash
+python geo_checksum.py auto --mode match
+```
 
 If more than one drive or more than one candidate workbook is found, it stops
 and tells you which ones, and you can point it at the right one:
@@ -63,9 +79,9 @@ python geo_checksum.py scan /Volumes/MyDrive/ProjectX --out checksums.csv
 On Windows the path looks like `E:\ProjectX`. You can pass several folders or
 individual files at once.
 
-This walks the folder recursively, hashes every sequencing / processed data
-file it recognises (`*.fastq.gz`, `*.bam`, `*.bw`, `*.txt`, `*.h5ad`, ...) and
-writes `checksums.csv` with the file name, MD5, size and full path. Progress and
+This walks the folder recursively, hashes every file (except obvious junk such
+as `.DS_Store`, `Thumbs.db`, Excel lock files, Word/PowerPoint documents and
+the tool's own outputs) and writes `checksums.csv` with the file name, MD5, size and full path. Progress and
 an ETA are printed as it goes. If the scan is interrupted, run the same command
 again and it picks up where it left off.
 
@@ -85,11 +101,19 @@ than one folder, since GEO matches on file name alone.
 
 ### 2. Fill in the Excel sheet
 
+Rebuild the checksum tab from the CSV (same as auto mode):
+
+```bash
+python geo_checksum.py fill checksums.csv --excel "Metadata for GEO submission.xlsx" --populate
+```
+
+Or only fill checksums next to file names already in the sheet:
+
 ```bash
 python geo_checksum.py fill checksums.csv --excel GEO_metadata.xlsx
 ```
 
-The tool looks for every header row in the workbook that has both a
+In that mode the tool looks for every header row in the workbook that has both a
 `file name` and a `file checksum` column. The official GEO metadata template
 has two such blocks, **RAW FILES** and **PROCESSED DATA FILES**, and both are
 handled. For each file name listed, the matching checksum is written into the
