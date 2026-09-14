@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# GEO checksum tool: progress cache and workbook backups
+_work/

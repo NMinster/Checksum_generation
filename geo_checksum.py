@@ -396,15 +396,20 @@ def _default_layout(ws) -> list[Section]:
 
 def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
                       sheet: str = "MD5 Checksums", output: Path | None = None,
-                      backup: bool = True, quiet: bool = False, replace: bool = False) -> dict:
+                      backup: bool = True, quiet: bool = False, replace: bool = False,
+                      fix_mismatched: bool = False, backup_dir: Path | None = None) -> dict:
     """Write the scanned files into the RAW FILES / PROCESSED DATA FILES blocks
     of *sheet*.
 
     By default existing rows are kept (merge): a file name already in the sheet
-    gets its checksum filled in or corrected, and files not yet listed are added
-    at the end of the right block. Names in the sheet that were not found on the
-    drive are left alone and reported. With replace=True both blocks are wiped
-    and rebuilt from scratch.
+    gets its checksum filled in if the cell is empty, and files not yet listed
+    are added at the end of the right block. An existing checksum that differs
+    from the file on disk is reported but left alone unless fix_mismatched=True.
+    Names in the sheet that were not found on the drive are left alone and
+    reported. With replace=True both blocks are wiped and rebuilt from scratch.
+
+    A copy of the original workbook is saved before writing: next to it as
+    '<name>.bak.xlsx', or in *backup_dir* with a timestamp if given.
 
     Raw files (fastq, bam, ...) go under RAW FILES, everything else under
     PROCESSED DATA FILES. Header rows and titles are never touched; if the sheet
@@ -447,7 +452,7 @@ def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
         existing = {}
 
     by_name = {r.file_name.lower(): r for r in records}
-    kept, filled, updated, not_found = [], [], [], []
+    kept, filled, updated, mismatched, not_found = [], [], [], [], []
     for name_l, (sec, row_idx) in existing.items():
         rec = by_name.get(name_l)
         cell = ws.cell(row=row_idx, column=sec.checksum_col)
@@ -460,8 +465,11 @@ def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
             cell.value = rec.checksum
             filled.append(rec.file_name)
         elif current != rec.checksum.lower():
-            cell.value = rec.checksum
-            updated.append((rec.file_name, current))
+            if fix_mismatched:
+                cell.value = rec.checksum
+                updated.append((rec.file_name, current))
+            else:
+                mismatched.append((rec.file_name, current, rec.checksum))
         else:
             kept.append(rec.file_name)
 
@@ -490,8 +498,14 @@ def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
             row_idx += 1
 
     out = output or excel_path
+    bak = None
     if out == excel_path and backup:
-        bak = excel_path.with_name(excel_path.stem + ".bak" + excel_path.suffix)
+        if backup_dir is not None:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d %H%M%S")
+            bak = backup_dir / f"{excel_path.stem} {stamp}{excel_path.suffix}"
+        else:
+            bak = excel_path.with_name(excel_path.stem + ".bak" + excel_path.suffix)
         shutil.copy2(excel_path, bak)
         if not quiet:
             print(f"Backup saved to {bak}", file=sys.stderr)
@@ -503,6 +517,9 @@ def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
               f"{len(updated)} corrected, {len(kept)} already correct -> {out}", file=sys.stderr)
         for name, old in updated:
             print(f"  corrected {name} (was {old})", file=sys.stderr)
+        for name, old, new in mismatched:
+            print(f"  WARNING: {name} has checksum {old} in the sheet but the file on the "
+                  f"drive gives {new}; left unchanged", file=sys.stderr)
         if not_found:
             print(f"  {len(not_found)} name(s) in the sheet were not found on the drive "
                   f"and were left as they are:", file=sys.stderr)
@@ -511,8 +528,9 @@ def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
     all_raw = [r.file_name for r in records if is_raw_file(r.file_name)]
     all_proc = [r.file_name for r in records if not is_raw_file(r.file_name)]
     return {"raw": sorted(all_raw, key=_natural_key), "processed": sorted(all_proc, key=_natural_key),
-            "added": added, "filled": filled, "updated": updated, "kept": kept,
-            "not_found": not_found, "sheet": ws.title, "workbook": out}
+            "added": added, "filled": filled, "updated": updated, "mismatched": mismatched,
+            "kept": kept, "not_found": not_found, "sheet": ws.title, "workbook": out,
+            "backup": bak}
 
 
 def excel_lock_file(excel_path: Path) -> Path | None:
@@ -874,18 +892,43 @@ def _ask(prompt: str) -> str:
         raise SystemExit("\nNo input available; quitting.")
 
 
+def _pick_folder_dialog() -> Path | None:
+    """Open the system 'choose a folder' window if tkinter is available."""
+    try:
+        import tkinter
+        from tkinter import filedialog
+    except Exception:
+        return None
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        chosen = filedialog.askdirectory(title="Choose the folder with the GEO Excel sheet "
+                                               "and the data files")
+        root.destroy()
+    except Exception:
+        return None
+    return Path(chosen) if chosen else None
+
+
 def _ask_folder() -> Path:
     print()
-    print("Paste the path to the folder that contains the Excel sheet and the data files.")
-    print("  Windows: open the folder in File Explorer, click the address bar, copy, paste here.")
-    print("  Mac:     drag the folder from Finder into this window.")
+    print("Which folder has the GEO Excel sheet and the data files?")
+    print("  Paste the folder path here and press Enter")
+    print("  (Windows: click the address bar in File Explorer, Ctrl+C, then paste here;")
+    print("   Mac: drag the folder from Finder into this window).")
+    print("  Or just press Enter to choose the folder in a window.")
     while True:
         text = _ask("Folder: ")
-        if not text.strip():
-            continue
         if text.strip().lower() in ("q", "quit", "exit"):
             raise SystemExit("Quit.")
-        path = _clean_path(text)
+        if not text.strip():
+            path = _pick_folder_dialog()
+            if path is None:
+                print("  (No folder chosen. Paste the path instead, or type q to quit.)")
+                continue
+        else:
+            path = _clean_path(text)
         if path.is_file():
             path = path.parent
         if path.is_dir():
@@ -907,12 +950,20 @@ def _choose(prompt: str, options: list[Path]) -> Path:
             return options[int(text) - 1]
 
 
+def _work_dir() -> Path:
+    """Where the tool keeps its own files (progress cache, backups): next to the
+    script, never inside the submission folder, so nothing extra gets uploaded."""
+    d = Path(__file__).resolve().parent / "_work"
+    d.mkdir(exist_ok=True)
+    return d
+
+
 def interactive() -> int:
     print("=" * 70)
     print("GEO checksum tool")
     print("Adds every data file in a folder, with its MD5 checksum, to the")
     print("'MD5 Checksums' tab of the GEO metadata Excel sheet in that folder.")
-    print("Entries already in the sheet are kept.")
+    print("Anything already in the sheet is kept as it is.")
     print("=" * 70)
 
     folder = _ask_folder()
@@ -931,11 +982,14 @@ def interactive() -> int:
     excel = _choose("\nWhich Excel file is the GEO metadata sheet?", workbooks)
     sheet = _checksum_sheet_name(excel)
 
-    # Preview
+    # Tool files live next to the script, keyed by folder, so the data folder stays clean.
+    work = _work_dir()
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", folder.name).strip("_") or "folder"
+    out_csv = work / f"checksums {slug} {hashlib.md5(str(folder.resolve()).encode()).hexdigest()[:8]}.csv"
+
     recursive = not _is_drive_root(folder)
-    out_csv = folder / "checksums.csv"
     files = [f for f in iter_data_files(folder, DEFAULT_PATTERNS, recursive=recursive)
-             if f.resolve() != excel.resolve() and f.resolve() != out_csv.resolve()]
+             if f.resolve() != excel.resolve()]
     n_raw = sum(1 for f in files if is_raw_file(f.name))
     total = sum(f.stat().st_size for f in files)
     print()
@@ -948,44 +1002,47 @@ def interactive() -> int:
     if not files:
         print("\nNothing to do: there are no data files in that folder.")
         return 1
-    if excel_lock_file(excel):
+    while excel_lock_file(excel):
         print()
-        print(f"  ** {excel.name} looks like it is OPEN in Excel. Please close it now, **")
-        print("  ** otherwise the result has to be saved as a separate copy.          **")
+        print(f"  {excel.name} is open in Excel. Please close it, then press Enter.")
+        if _ask("  (or type q to quit) ").strip().lower() in ("q", "quit"):
+            return 1
     print()
-    print("Hashing large files takes a while (roughly 1-2 minutes per 10 GB on a USB drive).")
+    print("Working... large files take a while (roughly 1-2 minutes per 10 GB on a USB drive).")
     print("You can close this window at any time; progress is saved and it resumes next run.")
-    if _ask("Press Enter to start, or type q to quit: ").strip().lower() in ("q", "quit"):
-        return 1
     print()
 
     records = scan(folder, out_csv, DEFAULT_PATTERNS, "md5", recursive=recursive,
-                   exclude=[excel, out_csv])
+                   exclude=[excel])
     if not records:
         print("No files could be hashed.")
         return 1
     write_checksum_csv(out_csv, records)
-    write_md5sum_file(folder / "checksums.md5", records)
 
     print()
-    summary = populate_workbook(excel, records, sheet=sheet, quiet=True)
+    summary = populate_workbook(excel, records, sheet=sheet, quiet=True,
+                                backup_dir=work / "backups")
     out = summary["workbook"]
     print("=" * 70)
-    print(f"Done. Updated tab '{summary['sheet']}' in: {out}")
+    print(f"DONE. Tab '{summary['sheet']}' in {out.name} now has:")
     print(f"  {len(summary['added'])} file(s) added")
-    print(f"  {len(summary['filled'])} checksum(s) filled in for names already listed")
-    print(f"  {len(summary['updated'])} checksum(s) corrected")
-    print(f"  {len(summary['kept'])} already correct, left as they were")
+    print(f"  {len(summary['filled'])} checksum(s) filled in for names that were already listed")
+    print(f"  {len(summary['kept'])} entries that were already complete, left untouched")
+    if summary["mismatched"]:
+        print(f"  {len(summary['mismatched'])} entries whose checksum in the sheet does NOT match "
+              f"the file on the drive (left unchanged, please check):")
+        for name, old, new in summary["mismatched"]:
+            print(f"      {name}: sheet says {old}, file gives {new}")
     if summary["not_found"]:
-        print(f"  {len(summary['not_found'])} name(s) in the sheet have no matching file in the "
-              f"folder (left as they were):")
+        print(f"  {len(summary['not_found'])} name(s) in the sheet with no matching file in the "
+              f"folder (left unchanged, please check the spelling):")
         for n in summary["not_found"]:
             print(f"      {n}")
     if out != excel:
         print(f"\n  NOTE: the original was open in Excel, so the result is in '{out.name}'.")
-        print("  Close Excel, delete the original and rename this file, or copy the tab over.")
-    else:
-        print(f"  A backup of the original is next to it as '{excel.stem}.bak{excel.suffix}'.")
+        print("  Close Excel, then delete the original and rename this file.")
+    if summary["backup"]:
+        print(f"\n  A copy of the sheet as it was before is in: {summary['backup']}")
     print("=" * 70)
     return 0
 

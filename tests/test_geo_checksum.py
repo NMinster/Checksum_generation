@@ -475,7 +475,8 @@ def test_merge_keeps_prior_entries(side_by_side_workbook):
     summary = gc.populate_workbook(side_by_side_workbook, recs, quiet=True, backup=False)
     assert summary["kept"] == ["old_R1.fastq", "old_matrix.h5"]
     assert summary["filled"] == ["typed_R1.fastq"]
-    assert summary["updated"] == [("old_R2.fastq", "1" * 32)]
+    assert summary["updated"] == []
+    assert summary["mismatched"] == [("old_R2.fastq", "1" * 32, md5(b"old_R2.fastq"))]
     assert summary["not_found"] == ["not_on_drive.fastq"]
     assert summary["added"] == ["new_R1.fastq", "new_positions.parquet"]
 
@@ -483,12 +484,21 @@ def test_merge_keeps_prior_entries(side_by_side_workbook):
     col_a = [sh.cell(row=r, column=1).value for r in range(5, 11)]
     assert col_a == ["old_R1.fastq", "old_R2.fastq", "typed_R1.fastq", "not_on_drive.fastq",
                      "new_R1.fastq", None]
-    assert sh["B6"].value == md5(b"old_R2.fastq")
+    assert sh["B6"].value == "1" * 32  # mismatched checksum is reported, never overwritten
     assert sh["B7"].value == md5(b"typed_R1.fastq")
     assert sh["B8"].value is None
     assert sh["B9"].value == md5(b"new_R1.fastq")
     assert sh["F6"].value == "old_matrix.h5" and sh["F7"].value == "new_positions.parquet"
     assert sh["F8"].value is None
+
+    # opt-in correction, with a timestamped backup in a separate folder
+    bdir = side_by_side_workbook.parent / "backups"
+    s2 = gc.populate_workbook(side_by_side_workbook, recs, quiet=True, fix_mismatched=True,
+                              backup_dir=bdir)
+    assert s2["updated"] == [("old_R2.fastq", "1" * 32)] and s2["mismatched"] == []
+    assert openpyxl.load_workbook(side_by_side_workbook)["MD5 Checksums"]["B6"].value == md5(b"old_R2.fastq")
+    assert s2["backup"].parent == bdir and s2["backup"].exists()
+    assert not side_by_side_workbook.with_name("Metadata for GEO submission.bak.xlsx").exists()
 
 
 def test_merge_is_idempotent(side_by_side_workbook):
@@ -499,7 +509,9 @@ def test_merge_is_idempotent(side_by_side_workbook):
     s2 = gc.populate_workbook(side_by_side_workbook, recs, quiet=True, backup=False)
     after = [[c.value for c in row] for row in
              openpyxl.load_workbook(side_by_side_workbook)["MD5 Checksums"].iter_rows()]
-    assert before == after and s2["added"] == [] and len(s2["kept"]) == 4
+    # the fixture's three stale checksums are reported, not touched, both times
+    assert before == after and s2["added"] == []
+    assert len(s2["kept"]) == 1 and len(s2["mismatched"]) == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -513,25 +525,41 @@ def test_clean_path():
     assert gc._clean_path("file:///Volumes/Backup%20Plus/GEO") == Path("/Volumes/Backup Plus/GEO")
 
 
-def test_interactive_wizard(fake_drive, monkeypatch, capsys):
+def test_interactive_wizard(fake_drive, tmp_path, monkeypatch, capsys):
     proj = fake_drive / "GEO_submission"
     wb_path = proj / "GEO_metadata.xlsx"
-    # a partially filled sheet: one name typed, no checksum
-    wb = openpyxl.load_workbook(wb_path)
-    wb.active["A3"] = "s1_R1.fastq.gz"
-    wb.save(wb_path)
+    work = tmp_path / "_work"
+    monkeypatch.setattr(gc, "_work_dir", lambda: work.mkdir(exist_ok=True) or work)
+    # the workbook is open in Excel at first
+    lock = wb_path.with_name("~$" + wb_path.name)
+    lock.write_bytes(b"")
 
-    answers = iter(["not/a/real/folder", f'"{proj}"', ""])  # bad path, good path, Enter
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    def answers():
+        yield "not/a/real/folder"          # bad path -> asked again
+        yield f'"{proj}"'                  # good path, quoted as Windows "Copy as path" does
+        lock.unlink()                      # user closes Excel...
+        yield ""                           # ...and presses Enter
+    it = answers()
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(it))
     rc = gc.main([])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "can't find a folder" in out
+    assert "can't find a folder" in out and "is open in Excel" in out
     # the fixture sheet already lists s1_R1, s1_R2 and counts.txt without checksums
-    assert "Done." in out and "3 checksum(s) filled in" in out and "1 file(s) added" in out
+    assert "DONE" in out and "3 checksum(s) filled in" in out and "1 file(s) added" in out
     ws = openpyxl.load_workbook(wb_path).active
     assert ws["A3"].value == "s1_R1.fastq.gz" and ws["C3"].value == md5(b"AAAA" * 10)
     assert ws["A4"].value == "s1_R2.fastq.gz" and ws["C4"].value == md5(b"CCCC" * 10)
     assert ws["A8"].value == "counts.txt" and ws["C8"].value == md5(b"x")
     assert ws["A9"].value == "lab_notes.xlsx"  # appended below the processed block
-    assert (proj / "checksums.csv").exists()
+    # nothing extra was dropped into the data folder
+    assert sorted(p.name for p in proj.iterdir()) == ["GEO_metadata.xlsx", "counts.txt",
+                                                       "fastq", "lab_notes.xlsx"]
+    assert list(work.glob("checksums *.csv")) and list((work / "backups").glob("*.xlsx"))
+
+    # second run: everything already there, nothing changes
+    it = iter([f"{proj}"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(it))
+    assert gc.main([]) == 0
+    out = capsys.readouterr().out
+    assert "0 file(s) added" in out and "4 entries that were already complete" in out
