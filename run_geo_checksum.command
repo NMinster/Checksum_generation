@@ -10,6 +10,6 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 "$PY" -c "import openpyxl" 2>/dev/null || "$PY" -m pip install --user -r requirements.txt
-"$PY" geo_checksum.py auto "$@"
+"$PY" geo_checksum.py "$@"
 echo
 read -r -p "Press Enter to close."

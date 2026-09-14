@@ -339,10 +339,11 @@ def iter_section_names(ws, section: Section, all_sections: list[Section]):
     title such as "PROCESSED DATA FILES" sitting directly above another header in
     the same column is skipped.
     """
-    title_rows = {s.header_row - 1 for s in all_sections if s.name_col == section.name_col}
-    for row_idx in range(section.header_row + 1, ws.max_row + 1):
-        if row_idx in title_rows:
-            continue
+    below = [s.header_row for s in all_sections
+             if s.name_col == section.name_col and s.header_row > section.header_row]
+    # Stop before the next block's title row (the row above its header).
+    last_row = (min(below) - 2) if below else ws.max_row
+    for row_idx in range(section.header_row + 1, last_row + 1):
         raw = ws.cell(row=row_idx, column=section.name_col).value
         if not isinstance(raw, str) or not raw.strip():
             continue
@@ -395,13 +396,19 @@ def _default_layout(ws) -> list[Section]:
 
 def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
                       sheet: str = "MD5 Checksums", output: Path | None = None,
-                      backup: bool = True, quiet: bool = False) -> dict:
-    """Rebuild *sheet* from the scanned files: clear the RAW FILES and PROCESSED
-    DATA FILES blocks and write every file name with its checksum.
+                      backup: bool = True, quiet: bool = False, replace: bool = False) -> dict:
+    """Write the scanned files into the RAW FILES / PROCESSED DATA FILES blocks
+    of *sheet*.
+
+    By default existing rows are kept (merge): a file name already in the sheet
+    gets its checksum filled in or corrected, and files not yet listed are added
+    at the end of the right block. Names in the sheet that were not found on the
+    drive are left alone and reported. With replace=True both blocks are wiped
+    and rebuilt from scratch.
 
     Raw files (fastq, bam, ...) go under RAW FILES, everything else under
-    PROCESSED DATA FILES. The header rows and titles already in the sheet are
-    kept; if the sheet is missing or empty, the standard layout is created.
+    PROCESSED DATA FILES. Header rows and titles are never touched; if the sheet
+    is missing or empty, the standard layout is created.
     """
     try:
         import openpyxl
@@ -423,22 +430,53 @@ def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
         ordered = sorted(sections, key=lambda sec: (sec.header_row, sec.name_col))
         raw_sec = raw_sec or ordered[0]
         proc_sec = proc_sec or (ordered[1] if len(ordered) > 1 else ordered[0])
+    blocks = [raw_sec] if raw_sec is proc_sec else [raw_sec, proc_sec]
 
-    # Wipe old entries below each header (only the name / checksum columns).
-    for sec in {raw_sec, proc_sec}:
-        for row_idx, _ in list(iter_section_names(ws, sec, sections)):
-            ws.cell(row=row_idx, column=sec.name_col).value = None
-            ws.cell(row=row_idx, column=sec.checksum_col).value = None
+    # What is already in the sheet?  name (lower-case) -> (section, row)
+    existing: dict[str, tuple[Section, int]] = {}
+    for sec in blocks:
+        for row_idx, name in iter_section_names(ws, sec, sections):
+            base = Path(name.replace("\\", "/")).name.lower()
+            existing.setdefault(base, (sec, row_idx))
 
-    raw = sorted((r for r in records if is_raw_file(r.file_name)),
-                 key=lambda r: _natural_key(r.file_name))
-    proc = sorted((r for r in records if not is_raw_file(r.file_name)),
-                  key=lambda r: _natural_key(r.file_name))
+    if replace:
+        for sec in blocks:
+            for row_idx, _ in list(iter_section_names(ws, sec, sections)):
+                ws.cell(row=row_idx, column=sec.name_col).value = None
+                ws.cell(row=row_idx, column=sec.checksum_col).value = None
+        existing = {}
+
+    by_name = {r.file_name.lower(): r for r in records}
+    kept, filled, updated, not_found = [], [], [], []
+    for name_l, (sec, row_idx) in existing.items():
+        rec = by_name.get(name_l)
+        cell = ws.cell(row=row_idx, column=sec.checksum_col)
+        shown = ws.cell(row=row_idx, column=sec.name_col).value
+        if rec is None:
+            not_found.append(str(shown).strip())
+            continue
+        current = str(cell.value).strip().lower() if cell.value not in (None, "") else ""
+        if not current:
+            cell.value = rec.checksum
+            filled.append(rec.file_name)
+        elif current != rec.checksum.lower():
+            cell.value = rec.checksum
+            updated.append((rec.file_name, current))
+        else:
+            kept.append(rec.file_name)
+
+    new_raw = sorted((r for r in records
+                      if is_raw_file(r.file_name) and r.file_name.lower() not in existing),
+                     key=lambda r: _natural_key(r.file_name))
+    new_proc = sorted((r for r in records
+                       if not is_raw_file(r.file_name) and r.file_name.lower() not in existing),
+                      key=lambda r: _natural_key(r.file_name))
     if raw_sec is proc_sec:
-        raw, proc = raw + proc, []
+        new_raw, new_proc = new_raw + new_proc, []
 
-    for sec, recs in ((raw_sec, raw), (proc_sec, proc)):
-        row_idx = sec.header_row + 1
+    for sec, recs in ((raw_sec, new_raw), (proc_sec, new_proc)):
+        used_rows = [r for r, _ in iter_section_names(ws, sec, sections)]
+        row_idx = (max(used_rows) + 1) if used_rows else sec.header_row + 1
         for rec in recs:
             # Do not run into another block stacked below this one.
             while any(row_idx in (o.header_row - 1, o.header_row) for o in sections
@@ -458,11 +496,23 @@ def populate_workbook(excel_path: Path, records: list[ChecksumRecord],
         if not quiet:
             print(f"Backup saved to {bak}", file=sys.stderr)
     out = _save_workbook(wb, out, quiet)
+
+    added = [r.file_name for r in new_raw + new_proc]
     if not quiet:
-        print(f"Wrote {len(raw)} raw and {len(proc)} processed file(s) to "
-              f"{out} [{ws.title}]", file=sys.stderr)
-    return {"raw": [r.file_name for r in raw], "processed": [r.file_name for r in proc],
-            "sheet": ws.title, "workbook": out}
+        print(f"{ws.title}: {len(added)} file(s) added, {len(filled)} checksum(s) filled in, "
+              f"{len(updated)} corrected, {len(kept)} already correct -> {out}", file=sys.stderr)
+        for name, old in updated:
+            print(f"  corrected {name} (was {old})", file=sys.stderr)
+        if not_found:
+            print(f"  {len(not_found)} name(s) in the sheet were not found on the drive "
+                  f"and were left as they are:", file=sys.stderr)
+            for n in not_found:
+                print(f"    {n}", file=sys.stderr)
+    all_raw = [r.file_name for r in records if is_raw_file(r.file_name)]
+    all_proc = [r.file_name for r in records if not is_raw_file(r.file_name)]
+    return {"raw": sorted(all_raw, key=_natural_key), "processed": sorted(all_proc, key=_natural_key),
+            "added": added, "filled": filled, "updated": updated, "kept": kept,
+            "not_found": not_found, "sheet": ws.title, "workbook": out}
 
 
 def excel_lock_file(excel_path: Path) -> Path | None:
@@ -676,6 +726,17 @@ def _pick_workbook(workbooks: list[Path]) -> Path:
     raise SystemExit(f"Found more than one GEO-style workbook; pick one with --excel:\n{listing}")
 
 
+def _is_drive_root(path: Path) -> bool:
+    """True for E:\\, /, /Volumes/Name, /media/user/Name and similar mount points."""
+    resolved = path.resolve()
+    if resolved.parent == resolved:
+        return True
+    try:
+        return resolved in {d.resolve() for d in candidate_drives()}
+    except Exception:
+        return False
+
+
 def _confirm(prompt: str, assume_yes: bool) -> bool:
     if assume_yes or not sys.stdin.isatty():
         return True
@@ -686,7 +747,8 @@ def _confirm(prompt: str, assume_yes: bool) -> bool:
 def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None = None,
          patterns: list[str] | None = None, algorithm: str = "md5", assume_yes: bool = False,
          overwrite: bool = False, quiet: bool = False, mode: str = "populate",
-         sheet: str | None = None, recursive: bool | None = None) -> dict:
+         sheet: str | None = None, recursive: bool | None = None,
+         replace: bool = False) -> dict:
     """Locate drive -> workbook -> data folder, then scan and fill in one go."""
     # 1. Which drive?
     if drive is None and excel is None and root is None:
@@ -723,14 +785,8 @@ def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None
     # If the workbook sits at the top of the drive, recursing would hash every
     # backup folder on it. Default to top-level files only in that case.
     resolved = data_root.resolve()
-    at_drive_root = resolved.parent == resolved  # e.g. E:\\ or /Volumes/X has no parent
-    if drive is not None and resolved == Path(drive).resolve():
-        at_drive_root = True
-    elif drive is None:
-        try:  # --excel given without --drive: still recognise a mount point
-            at_drive_root = at_drive_root or resolved in {d.resolve() for d in candidate_drives()}
-        except Exception:
-            pass
+    at_drive_root = _is_drive_root(data_root) or (
+        drive is not None and resolved == Path(drive).resolve())
     if recursive is None:
         recursive = not at_drive_root
 
@@ -753,8 +809,9 @@ def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None
               f"finishes, otherwise the result is saved to a copy next to it.", file=sys.stderr)
     if mode == "populate":
         target_sheet = sheet or _checksum_sheet_name(excel)
-        print(f"Sheet:     {target_sheet} (will be rebuilt from the files found)", file=sys.stderr)
-        question = "Hash every data file under the data root and rebuild that sheet?"
+        what = "rebuilt from scratch" if replace else "existing entries kept, new files added"
+        print(f"Sheet:     {target_sheet} ({what})", file=sys.stderr)
+        question = "Hash every data file under the data root and update that sheet?"
     else:
         question = "Hash every data file under the data root and fill in the checksums?"
     if not _confirm(question, assume_yes):
@@ -767,9 +824,9 @@ def auto(drive: Path | None = None, excel: Path | None = None, root: Path | None
     write_checksum_csv(out_csv, records)
     write_md5sum_file(excel.parent / "checksums.md5", records)
     if mode == "populate":
-        summary = populate_workbook(excel, records, sheet=target_sheet, quiet=quiet)
-        summary["missing"] = []
-        summary["filled"] = summary["raw"] + summary["processed"]
+        summary = populate_workbook(excel, records, sheet=target_sheet, quiet=quiet,
+                                    replace=replace)
+        summary["missing"] = summary["not_found"]
     else:
         summary = fill_workbook(excel, records, sheet=sheet, overwrite=overwrite, quiet=quiet)
     summary["workbook"] = excel
@@ -792,6 +849,145 @@ def _checksum_sheet_name(excel: Path) -> str:
     finally:
         wb.close()
     return "MD5 Checksums"
+
+
+# --------------------------------------------------------------------------- #
+# Interactive mode: no options, just "where is the folder?"
+# --------------------------------------------------------------------------- #
+
+def _clean_path(text: str) -> Path:
+    """Turn whatever was pasted into a Path: strips quotes, spaces, file:// prefixes."""
+    t = text.strip().strip('"').strip("'").strip()
+    if t.lower().startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        t = unquote(urlparse(t).path)
+        if sys.platform.startswith("win") and t.startswith("/") and t[2:3] == ":":
+            t = t[1:]
+    t = t.replace("\\ ", " ")  # paths dragged into a macOS terminal escape spaces
+    return Path(t).expanduser()
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError:
+        raise SystemExit("\nNo input available; quitting.")
+
+
+def _ask_folder() -> Path:
+    print()
+    print("Paste the path to the folder that contains the Excel sheet and the data files.")
+    print("  Windows: open the folder in File Explorer, click the address bar, copy, paste here.")
+    print("  Mac:     drag the folder from Finder into this window.")
+    while True:
+        text = _ask("Folder: ")
+        if not text.strip():
+            continue
+        if text.strip().lower() in ("q", "quit", "exit"):
+            raise SystemExit("Quit.")
+        path = _clean_path(text)
+        if path.is_file():
+            path = path.parent
+        if path.is_dir():
+            return path
+        print(f"  Sorry, I can't find a folder at: {path}")
+        print("  Check the spelling, make sure the drive is plugged in, and try again "
+              "(or type q to quit).")
+
+
+def _choose(prompt: str, options: list[Path]) -> Path:
+    if len(options) == 1:
+        return options[0]
+    print(prompt)
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}. {opt.name}")
+    while True:
+        text = _ask(f"Enter a number (1-{len(options)}): ").strip()
+        if text.isdigit() and 1 <= int(text) <= len(options):
+            return options[int(text) - 1]
+
+
+def interactive() -> int:
+    print("=" * 70)
+    print("GEO checksum tool")
+    print("Adds every data file in a folder, with its MD5 checksum, to the")
+    print("'MD5 Checksums' tab of the GEO metadata Excel sheet in that folder.")
+    print("Entries already in the sheet are kept.")
+    print("=" * 70)
+
+    folder = _ask_folder()
+
+    # Which Excel file?
+    workbooks = find_geo_workbooks(folder, max_depth=1)
+    if not workbooks:
+        workbooks = sorted(p for p in folder.iterdir()
+                           if p.suffix.lower() in (".xlsx", ".xlsm")
+                           and not p.name.startswith(("~$", "._"))
+                           and not p.name.lower().endswith(".bak.xlsx"))
+    if not workbooks:
+        print(f"\nNo Excel file (.xlsx) found in {folder}.")
+        print("Put the GEO metadata sheet in the same folder as the data files and run again.")
+        return 1
+    excel = _choose("\nWhich Excel file is the GEO metadata sheet?", workbooks)
+    sheet = _checksum_sheet_name(excel)
+
+    # Preview
+    recursive = not _is_drive_root(folder)
+    out_csv = folder / "checksums.csv"
+    files = [f for f in iter_data_files(folder, DEFAULT_PATTERNS, recursive=recursive)
+             if f.resolve() != excel.resolve() and f.resolve() != out_csv.resolve()]
+    n_raw = sum(1 for f in files if is_raw_file(f.name))
+    total = sum(f.stat().st_size for f in files)
+    print()
+    print(f"Folder:      {folder}")
+    print(f"Excel sheet: {excel.name}  (tab: {sheet})")
+    print(f"Files found: {len(files)}  ({n_raw} raw sequencing files, "
+          f"{len(files) - n_raw} processed/other files, {_fmt_bytes(total)} in total)")
+    if not recursive:
+        print("  Note: this is the top of a drive, so only the files directly in it are used.")
+    if not files:
+        print("\nNothing to do: there are no data files in that folder.")
+        return 1
+    if excel_lock_file(excel):
+        print()
+        print(f"  ** {excel.name} looks like it is OPEN in Excel. Please close it now, **")
+        print("  ** otherwise the result has to be saved as a separate copy.          **")
+    print()
+    print("Hashing large files takes a while (roughly 1-2 minutes per 10 GB on a USB drive).")
+    print("You can close this window at any time; progress is saved and it resumes next run.")
+    if _ask("Press Enter to start, or type q to quit: ").strip().lower() in ("q", "quit"):
+        return 1
+    print()
+
+    records = scan(folder, out_csv, DEFAULT_PATTERNS, "md5", recursive=recursive,
+                   exclude=[excel, out_csv])
+    if not records:
+        print("No files could be hashed.")
+        return 1
+    write_checksum_csv(out_csv, records)
+    write_md5sum_file(folder / "checksums.md5", records)
+
+    print()
+    summary = populate_workbook(excel, records, sheet=sheet, quiet=True)
+    out = summary["workbook"]
+    print("=" * 70)
+    print(f"Done. Updated tab '{summary['sheet']}' in: {out}")
+    print(f"  {len(summary['added'])} file(s) added")
+    print(f"  {len(summary['filled'])} checksum(s) filled in for names already listed")
+    print(f"  {len(summary['updated'])} checksum(s) corrected")
+    print(f"  {len(summary['kept'])} already correct, left as they were")
+    if summary["not_found"]:
+        print(f"  {len(summary['not_found'])} name(s) in the sheet have no matching file in the "
+              f"folder (left as they were):")
+        for n in summary["not_found"]:
+            print(f"      {n}")
+    if out != excel:
+        print(f"\n  NOTE: the original was open in Excel, so the result is in '{out.name}'.")
+        print("  Close Excel, delete the original and rename this file, or copy the tab over.")
+    else:
+        print(f"  A backup of the original is next to it as '{excel.stem}.bak{excel.suffix}'.")
+    print("=" * 70)
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -845,8 +1041,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Write checksums from a CSV (made by 'scan') into an Excel sheet")
     f.add_argument("csv", type=Path, help="checksums.csv produced by 'scan'")
     f.add_argument("--populate", action="store_true",
-                   help="Rebuild the sheet with every file in the CSV instead of matching "
-                        "names already present (default sheet: 'MD5 Checksums')")
+                   help="Add every file in the CSV to the sheet, keeping entries already there "
+                        "(default sheet: 'MD5 Checksums')")
+    f.add_argument("--replace", action="store_true",
+                   help="With --populate: wipe the RAW / PROCESSED blocks and rebuild them")
     f.add_argument("-q", "--quiet", action="store_true")
 
     a = sub.add_parser("auto",
@@ -863,8 +1061,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Top-level files only (folders named like fastq files are still read)")
     a.add_argument("--algorithm", default="md5", choices=sorted(hashlib.algorithms_guaranteed))
     a.add_argument("--mode", choices=["populate", "match"], default="populate",
-                   help="populate (default): rebuild the checksum sheet with every file found; "
-                        "match: only fill checksums next to file names already in the sheet")
+                   help="populate (default): add every file found to the checksum sheet, keeping "
+                        "entries already there; match: only fill checksums next to file names "
+                        "already in the sheet")
+    a.add_argument("--replace", action="store_true",
+                   help="populate mode: wipe the RAW / PROCESSED blocks and rebuild them")
     a.add_argument("--sheet", help="Sheet to rebuild / fill (default: the 'MD5 Checksums' tab)")
     a.add_argument("--overwrite", action="store_true",
                    help="match mode: replace checksums already present in the sheet")
@@ -915,7 +1116,8 @@ def cmd_fill(args) -> int:
         raise SystemExit(f"No checksums found in {args.csv}")
     if args.populate:
         populate_workbook(args.excel, records, sheet=args.sheet or _checksum_sheet_name(args.excel),
-                          output=args.output, backup=not args.no_backup, quiet=args.quiet)
+                          output=args.output, backup=not args.no_backup, quiet=args.quiet,
+                          replace=args.replace)
         return 0
     summary = fill_workbook(args.excel, records, **_excel_kwargs(args))
     return 0 if not summary["missing"] else 2
@@ -925,9 +1127,8 @@ def cmd_auto(args) -> int:
     summary = auto(drive=args.drive, excel=args.excel, root=args.root, patterns=args.pattern,
                    algorithm=args.algorithm, assume_yes=args.yes, overwrite=args.overwrite,
                    quiet=args.quiet, mode=args.mode, sheet=args.sheet,
-                   recursive=args.recursive)
-    print(f"Done. {len(summary['filled'])} checksum(s) written to {summary['workbook']}",
-          file=sys.stderr)
+                   recursive=args.recursive, replace=args.replace)
+    print(f"Done: {summary['workbook']}", file=sys.stderr)
     return 0 if not summary["missing"] else 2
 
 
@@ -952,6 +1153,20 @@ def cmd_verify(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        # Double-clicked or run with no options: ask for the folder and do everything.
+        try:
+            return interactive()
+        except KeyboardInterrupt:
+            print("\nStopped. Progress so far is saved; run again to continue.", file=sys.stderr)
+            return 130
+        except SystemExit as exc:
+            if exc.code not in (None, 0) and not isinstance(exc.code, int):
+                print(f"\nProblem: {exc.code}", file=sys.stderr)
+                return 1
+            raise
     args = build_parser().parse_args(argv)
     try:
         return {"scan": cmd_scan, "fill": cmd_fill, "verify": cmd_verify,

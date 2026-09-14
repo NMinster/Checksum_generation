@@ -16,81 +16,76 @@ Python 3.9 or newer.
 pip install -r requirements.txt
 ```
 
-## Quick start: fully automatic
+## Quick start (no computer skills needed)
 
-Keep the GEO metadata workbook on the external drive, in the folder that
-holds the data files (subfolders are fine). Plug the drive in, then:
+1. Put the GEO metadata Excel sheet (for example
+   `Metadata for GEO submission.xlsx`) in the same folder as the data files on
+   the external drive, e.g. `E:\GEO submission_spatial`.
+2. Close the Excel sheet if it is open.
+3. Double-click the launcher in this folder:
+   * **Windows**: `run_geo_checksum.bat`
+   * **Mac**: `run_geo_checksum.command` (the first time, right-click it and
+     choose Open, because it is not signed)
+4. A window opens and asks for the folder. Copy the folder's path from the
+   File Explorer address bar (or drag the folder into the window on a Mac),
+   paste it, and press Enter.
+5. It shows what it found and asks you to press Enter to start. Hashing takes
+   roughly one to two minutes per 10 GB on a USB drive; you can close the
+   window at any time and run it again later, it carries on where it stopped.
+6. When it says **Done**, open the Excel sheet: the `MD5 Checksums` tab now has
+   every file with its checksum.
 
-* **macOS**: double-click `run_geo_checksum.command` (the first time, right-click
-  and choose Open, since it is not signed)
-* **Windows**: double-click `run_geo_checksum.bat`
-* **any terminal**: `python geo_checksum.py auto`
+What it does to the sheet:
 
-The tool then
+* Sequencing files (`.fastq`, `.fastq.gz`, `.fq`, `.bam`, `.cram`, `.sra`) go
+  under **RAW FILES**; everything else (`.h5`, `.json`, `.parquet`, `.png`,
+  `.csv`, ...) goes under **PROCESSED DATA FILES**.
+* **Anything you already typed into the tab is kept.** A file name that is
+  already there gets its checksum filled in (or corrected if it was wrong),
+  files that are not listed yet are added at the bottom of the right block, and
+  names in the sheet that have no matching file in the folder are left alone
+  and listed at the end so you can check them.
+* Titles, header rows and the other tabs are not touched. A copy of the
+  original is saved next to it as `... .bak.xlsx` before anything is changed.
+* The blocks can be stacked (official GEO template) or side by side (RAW in
+  columns A:B, PROCESSED in F:G). If there is no checksum tab, one is created.
 
-1. finds the attached external drive (`/Volumes/*` on macOS, non-system drive
-   letters on Windows, `/media` and `/run/media` on Linux),
-2. searches it for an `.xlsx` that has `file name` and `file checksum` columns,
-   which is how it recognises the GEO workbook (for example
-   `Metadata for GEO submission.xlsx`),
-3. shows you what it found and asks for confirmation,
-4. hashes every file in the workbook's folder and subfolders, saving progress
-   to `checksums.csv` next to the workbook so an interrupted run can resume,
-5. rebuilds the `MD5 Checksums` tab: the **RAW FILES** block gets every
-   sequencing file (`.fastq`, `.fq`, `.bam`, `.cram`, `.sra`, gzipped or not)
-   and the **PROCESSED DATA FILES** block gets everything else (`.h5`, `.json`,
-   `.csv`, `.png`, ...), each as a file name plus its MD5. Old entries in those
-   two blocks are cleared first, titles and header rows are kept, the other
-   tabs are untouched, and a `.bak` copy of the workbook is saved.
-
-The blocks can be stacked (as in the official GEO template) or side by side
-(RAW in columns A:B, PROCESSED in F:G). If the tab does not exist it is
-created with the side-by-side layout.
+If the first launcher run says Python is missing, install it from
+https://www.python.org/downloads/ (on Windows tick "Add python.exe to PATH")
+and double-click the launcher again. The launcher installs the one extra
+package it needs (`openpyxl`) by itself.
 
 Things it handles on a real drive:
 
-* **Workbook at the top of the drive** (for example `E:\Metadata for GEO
-  submission.xlsx` with the data files beside it): only the top-level files
-  are hashed, so unrelated backup folders on the same drive are skipped. The
-  skipped folders are listed; pass `--recursive` to include them.
+* **Folder at the top of the drive** (files directly in `E:\`): only the
+  files directly in it are used, so other backup folders on the drive are not
+  swept in.
 * **Fastq "files" that are really folders** (some download tools create a
   folder named `X_R1_001.fastq.gz` with the file inside): the folder is
   entered and the file inside is hashed under its own name. A note lists such
   folders, since GEO needs the files, not the folders.
-* **Workbook open in Excel**: a warning is shown up front. If it is still open
-  when the hashing finishes, you are asked to close it and press Enter; if
-  nobody is there to answer, the result is saved as
+* **Sheet still open in Excel** when hashing finishes: you are asked to close
+  it and press Enter. If nobody is there to answer, the result is saved as
   `... (with checksums).xlsx` next to the original so nothing is lost.
 
-If you would rather keep the file names you typed and only have the checksums
-filled in next to them, use match mode:
+## Command-line use
+
+Everything above is also available without the prompts:
 
 ```bash
-python geo_checksum.py auto --mode match
-```
-
-For a drive laid out like `E:\GEO submission_spatial\Metadata for GEO
-submission.xlsx` with the fastq, h5, json, parquet and png files in that same
-folder, no options are needed: the workbook is found, that folder becomes the
-data root, and the `MD5 Checksums` tab is rebuilt. To be explicit anyway:
-
-```bat
+python geo_checksum.py auto                      # find the drive and workbook automatically
 python geo_checksum.py auto --excel "E:\GEO submission_spatial\Metadata for GEO submission.xlsx"
+python geo_checksum.py auto --replace            # wipe the RAW / PROCESSED blocks and rebuild them
+python geo_checksum.py auto --mode match         # only fill checksums next to names already listed
+python geo_checksum.py auto -y                   # skip the confirmation prompt
 ```
 
-If more than one drive or more than one candidate workbook is found, it stops
-and tells you which ones, and you can point it at the right one:
-
-```bash
-python geo_checksum.py auto --drive /Volumes/SEQDATA
-python geo_checksum.py auto --excel /Volumes/SEQDATA/project/GEO_metadata.xlsx
-python geo_checksum.py auto --excel ... --root /Volumes/SEQDATA/project/data   # data in a different folder
-python geo_checksum.py auto -y            # skip the confirmation prompt
-```
-
-The launchers install `openpyxl` on first run if it is missing. If the repo
-was downloaded as a zip into Downloads, unzip it first; the launcher works
-from wherever the folder sits.
+Auto mode looks for an attached external drive (`/Volumes/*` on macOS,
+non-system drive letters on Windows, `/media` and `/run/media` on Linux),
+searches it for an `.xlsx` that has `file name` and `file checksum` columns,
+and uses that workbook's folder as the data root. If more than one drive or
+workbook is found it lists them so you can pick with `--drive` or `--excel`;
+`--root` points at a data folder other than the workbook's.
 
 ## Manual usage
 
@@ -125,7 +120,8 @@ than one folder, since GEO matches on file name alone.
 
 ### 2. Fill in the Excel sheet
 
-Rebuild the checksum tab from the CSV (same as auto mode):
+Add the files in the CSV to the checksum tab, keeping existing entries (same as
+auto mode; add `--replace` to rebuild the blocks from scratch):
 
 ```bash
 python geo_checksum.py fill checksums.csv --excel "Metadata for GEO submission.xlsx" --populate

@@ -11,6 +11,6 @@ if not defined PY (
   exit /b 1
 )
 %PY% -c "import openpyxl" 2>nul || %PY% -m pip install --user -r requirements.txt
-%PY% geo_checksum.py auto %*
+%PY% geo_checksum.py %*
 echo.
 pause

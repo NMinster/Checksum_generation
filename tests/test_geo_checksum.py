@@ -305,7 +305,8 @@ def test_populate_side_by_side(side_by_side_workbook):
     names = ["CG3_S1_L001_R1_001.fastq", "CG3_S1_L001_R2_001.fastq", "C4_S1_L002_R1_001.fastq",
              "CG3_filtered_feature_bc_matrix.h5", "CG3_scalefactors_json.json",
              "CG3_tissue_positions.csv", "CG3_tissue_hires_image.png"]
-    summary = gc.populate_workbook(side_by_side_workbook, _records(names), quiet=True, backup=False)
+    summary = gc.populate_workbook(side_by_side_workbook, _records(names), quiet=True, backup=False,
+                                   replace=True)
     assert summary["sheet"] == "MD5 Checksums"
     assert summary["raw"] == ["C4_S1_L002_R1_001.fastq", "CG3_S1_L001_R1_001.fastq",
                               "CG3_S1_L001_R2_001.fastq"]
@@ -403,7 +404,7 @@ def test_save_falls_back_when_workbook_open_in_excel(side_by_side_workbook, monk
     monkeypatch.setattr(wbmod.Workbook, "save", locked_save)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     summary = gc.populate_workbook(side_by_side_workbook, _records(["a_R1.fastq"]),
-                                   quiet=True, backup=False)
+                                   quiet=True, backup=False, replace=True)
     alt = side_by_side_workbook.with_name("Metadata for GEO submission (with checksums).xlsx")
     assert summary["workbook"] == alt and alt.exists()
     assert openpyxl.load_workbook(alt)["MD5 Checksums"]["A5"].value == "a_R1.fastq"
@@ -452,3 +453,85 @@ def test_pick_workbook_prefers_geo_folder(tmp_path):
     c = tmp_path / "GEO submission_spatial" / "Metadata for GEO submission (with checksums).xlsx"
     with pytest.raises(SystemExit, match="more than one"):
         gc._pick_workbook([b, c])
+
+
+# --------------------------------------------------------------------------- #
+# merge into a partially completed sheet
+# --------------------------------------------------------------------------- #
+
+def test_merge_keeps_prior_entries(side_by_side_workbook):
+    ws = openpyxl.load_workbook(side_by_side_workbook)
+    sh = ws["MD5 Checksums"]
+    # row 5: old_R1 has a correct checksum; row 6: old_R2 has a WRONG checksum;
+    # row 7: typed by hand, no checksum yet; row 8: listed but not on the drive.
+    sh["B5"] = md5(b"old_R1.fastq")
+    sh["A7"], sh["B7"] = "typed_R1.fastq", None
+    sh["A8"], sh["B8"] = "not_on_drive.fastq", None
+    sh["G6"] = md5(b"old_matrix.h5")
+    ws.save(side_by_side_workbook)
+
+    recs = _records(["old_R1.fastq", "old_R2.fastq", "typed_R1.fastq", "new_R1.fastq",
+                     "old_matrix.h5", "new_positions.parquet"])
+    summary = gc.populate_workbook(side_by_side_workbook, recs, quiet=True, backup=False)
+    assert summary["kept"] == ["old_R1.fastq", "old_matrix.h5"]
+    assert summary["filled"] == ["typed_R1.fastq"]
+    assert summary["updated"] == [("old_R2.fastq", "1" * 32)]
+    assert summary["not_found"] == ["not_on_drive.fastq"]
+    assert summary["added"] == ["new_R1.fastq", "new_positions.parquet"]
+
+    sh = openpyxl.load_workbook(side_by_side_workbook)["MD5 Checksums"]
+    col_a = [sh.cell(row=r, column=1).value for r in range(5, 11)]
+    assert col_a == ["old_R1.fastq", "old_R2.fastq", "typed_R1.fastq", "not_on_drive.fastq",
+                     "new_R1.fastq", None]
+    assert sh["B6"].value == md5(b"old_R2.fastq")
+    assert sh["B7"].value == md5(b"typed_R1.fastq")
+    assert sh["B8"].value is None
+    assert sh["B9"].value == md5(b"new_R1.fastq")
+    assert sh["F6"].value == "old_matrix.h5" and sh["F7"].value == "new_positions.parquet"
+    assert sh["F8"].value is None
+
+
+def test_merge_is_idempotent(side_by_side_workbook):
+    recs = _records(["old_R1.fastq", "old_R2.fastq", "old_matrix.h5", "x.png"])
+    gc.populate_workbook(side_by_side_workbook, recs, quiet=True, backup=False)
+    before = [[c.value for c in row] for row in
+              openpyxl.load_workbook(side_by_side_workbook)["MD5 Checksums"].iter_rows()]
+    s2 = gc.populate_workbook(side_by_side_workbook, recs, quiet=True, backup=False)
+    after = [[c.value for c in row] for row in
+             openpyxl.load_workbook(side_by_side_workbook)["MD5 Checksums"].iter_rows()]
+    assert before == after and s2["added"] == [] and len(s2["kept"]) == 4
+
+
+# --------------------------------------------------------------------------- #
+# interactive wizard
+# --------------------------------------------------------------------------- #
+
+def test_clean_path():
+    assert gc._clean_path('  "E:\\GEO submission_spatial"  ') == Path("E:\\GEO submission_spatial")
+    assert gc._clean_path("'/Volumes/Backup Plus/GEO'") == Path("/Volumes/Backup Plus/GEO")
+    assert gc._clean_path("/Volumes/Backup\\ Plus/GEO") == Path("/Volumes/Backup Plus/GEO")
+    assert gc._clean_path("file:///Volumes/Backup%20Plus/GEO") == Path("/Volumes/Backup Plus/GEO")
+
+
+def test_interactive_wizard(fake_drive, monkeypatch, capsys):
+    proj = fake_drive / "GEO_submission"
+    wb_path = proj / "GEO_metadata.xlsx"
+    # a partially filled sheet: one name typed, no checksum
+    wb = openpyxl.load_workbook(wb_path)
+    wb.active["A3"] = "s1_R1.fastq.gz"
+    wb.save(wb_path)
+
+    answers = iter(["not/a/real/folder", f'"{proj}"', ""])  # bad path, good path, Enter
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    rc = gc.main([])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "can't find a folder" in out
+    # the fixture sheet already lists s1_R1, s1_R2 and counts.txt without checksums
+    assert "Done." in out and "3 checksum(s) filled in" in out and "1 file(s) added" in out
+    ws = openpyxl.load_workbook(wb_path).active
+    assert ws["A3"].value == "s1_R1.fastq.gz" and ws["C3"].value == md5(b"AAAA" * 10)
+    assert ws["A4"].value == "s1_R2.fastq.gz" and ws["C4"].value == md5(b"CCCC" * 10)
+    assert ws["A8"].value == "counts.txt" and ws["C8"].value == md5(b"x")
+    assert ws["A9"].value == "lab_notes.xlsx"  # appended below the processed block
+    assert (proj / "checksums.csv").exists()
